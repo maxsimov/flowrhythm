@@ -1,33 +1,33 @@
-# flowrhythm
+# `flowrhythm`
 
-**Asynchronous Job Processing Framework with Dynamic Worker Scaling**
+**Asynchronous Job Processing Framework with Auto-Scaling**
 
-`flowrhythm` is a modular, asyncio-based framework for building efficient data pipelines. It provides automatic worker scaling based on job utilization, supports custom job capacities, and includes mechanisms for routing failed tasks to error handlers.
+`flowrhythm` is a flexible, asyncio-based job pipeline framework. It chains jobs into flows, dynamically adjusts workers based on workload, and handles errors gracefully. It's designed for robust async processing with smart worker management.
 
 ---
 
-## Features
+## 🚀 Features
 
-- 🔁 **Pipeline Composition** — Chain multiple async jobs with flexible configuration
-- 🧠 **Utilization-Based Scaling** — Add or remove workers based on actual workload
-- ⚙️ **Custom Job Capacity** — Fine-tune queue size, worker counts, and scaling thresholds
-- 🚨 **Error Handling Support** — Automatically reroute failed jobs to an error handler
+- 🔁 **Pipeline Composition** — Connect async jobs with automatic queue wiring
+- 📈 **Auto Scaling** — Worker count adjusts using utilization thresholds
+- ⚙️ **Custom Capacity** — Per-job settings for workers, queues, and scaling
+- 🧯 **Error Handling** — Reroute failed jobs to a dedicated error job
 - 📊 **Worker Metrics** — Tracks idle, active, and blocked workers
-- ✅ **Graceful Termination** — Built-in signaling for orderly pipeline shutdown
+- ⏹️ **Graceful Shutdown** — End-of-work signaling with `LastWorkItem`
 
 ---
 
-## Installation
+## 📦 Installation
 
 ```bash
 pip install flowrhythm
 ```
 
-> Not yet published. Run `pip install .` locally after building if you're testing it yourself.
+_Not yet published. Use `pip install .` locally from source._
 
 ---
 
-## Usage Example
+## 🔧 Example
 
 ```python
 import asyncio
@@ -50,7 +50,7 @@ async def main():
     flow.add(first_stage)
     flow.add(second_stage)
     await flow.start()
-    await flow._jobs[0]._input.put(0)  # Start the pipeline
+    await flow._jobs[0]._input.put(0)
     await flow.run()
 
 asyncio.run(main())
@@ -58,56 +58,146 @@ asyncio.run(main())
 
 ---
 
-## Concepts
+## 🧠 Concepts
 
 ### Flow
 
-Manages the chain of jobs. You can add regular jobs and a dedicated error job.
+- Manages the lifecycle and execution of connected jobs
+- Starts and stops all jobs
+- Monitors when all workers are done
 
 ### Job
 
-A processing step that consumes input and produces output. Each job has its own queue and worker pool.
+- Each job has:
+  - Input/output queue
+  - One or more workers
+  - Context manager for startup/cleanup
+- Auto-connected by `flow.add(...)`
 
 ### Capacity
 
-Controls worker scaling and queue limits:
+Controls job scaling:
+
 - `initial_workers`, `min_workers`, `max_workers`
 - `queue_length`
-- `lower_threshold`, `upper_threshold`
-- `cooldown`, `sampling`, `dampening`
+- Utilization thresholds: `lower_threshold`, `upper_threshold`
+- Timing: `cooldown`, `sampling`, `dampening`
+
+### Error Job
+
+Handles work rerouted due to:
+- `RouteToErrorQueue`
+- Unhandled exceptions in job processors
 
 ### LastWorkItem
 
-Signals the end of processing. Triggers shutdown across all jobs.
-
-### Error Routing
-
-Exceptions like `RouteToErrorQueue` and `StopProcessing` help redirect or skip processing safely.
+- Signals end of input
+- Triggers shutdown across job chain
 
 ---
 
-## Decorators
+## ⚙️ Decorators
 
-- `@job_name(name)` — Assigns a readable name
-- `@job_capacity(capacity)` — Binds a custom `Capacity` instance
-- `@workers(min, max, initial)` — Sets worker range and startup count
-
----
-
-## Strategy
-
-Currently supports:
-- `Strategy.UTILIZATION` (default): scales workers based on real-time job utilization
+- `@job_name(name)` — Human-readable job name
+- `@job_capacity(capacity)` — Custom `Capacity` object
+- `@workers(min, max, initial)` — Quick worker setup
 
 ---
 
-## License
+## 📐 Class Diagram
 
-MIT License. See `LICENSE` for details.
+```mermaid
+classDiagram
+    class Flow {
+        +add()
+        +run()
+        +start()
+        +stop()
+        -_create_job()
+    }
+
+    class _Job {
+        -_processor_context
+        -_cap : Capacity
+        -_input : Queue
+        -_output : Queue
+        -_workers : set
+        +start()
+        +stop()
+        +_scale_up()
+        +_scale_down()
+    }
+
+    class _Worker {
+        -_task
+        +main()
+        +cancel()
+    }
+
+    class Capacity {
+        +initial_workers
+        +min_workers
+        +max_workers
+        +queue_length
+    }
+
+    class UtilizationCapacity {
+        +lower_threshold
+        +upper_threshold
+        +cooldown
+        +sampling
+        +dampening
+    }
+
+    Flow --> _Job
+    _Job --> _Worker
+    _Job --> Capacity
+    UtilizationCapacity --> Capacity
+```
 
 ---
 
-## Author
+## 🔄 Flow Lifecycle
 
-Andrey Maximov  
+```mermaid
+flowchart TD
+    A[Start Flow] --> B[Stage 1]
+    B --> C[Stage 2]
+    C --> D{Is LastWorkItem?}
+    D -- Yes --> E[Propagate LastWorkItem to next stage]
+    D -- No --> B
+```
+
+Each job:
+- Receives input from previous job
+- Processes it
+- Pushes result to next stage
+- Scales workers based on utilization
+
+---
+
+## 📚 Strategy
+
+Currently only one:
+
+- `Strategy.UTILIZATION`: Dynamically scales workers based on how busy they are
+
+---
+
+## 🛠️ Exception Types
+
+- `StopProcessing`: Skip this item, continue flow
+- `RouteToErrorQueue`: Send item to error handler
+
+---
+
+## 📄 License
+
+MIT License. See `LICENSE`.
+
+---
+
+## 👤 Author
+
+**Andrey Maximov**  
 [GitHub](https://github.com/yourusername)
