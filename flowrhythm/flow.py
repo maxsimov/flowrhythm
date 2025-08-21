@@ -22,12 +22,19 @@ logger = logging.getLogger(__name__)
 
 
 Processor = Callable[[Any], Awaitable[Any]]
+ProcessorLock = AsyncContextManager[Processor]
 ProcessorFactory = AsyncContextManager[Processor]
 
 
 @asynccontextmanager
-async def stub_job_context():
-    yield None
+async def stub_factory(processor: Processor):
+    yield processor
+
+
+@asynccontextmanager
+async def stub_factory_lock(processor: Processor, resource_manager: ProcessorLock):
+    async with resource_manager:
+        yield processor
 
 
 class Flow:
@@ -42,7 +49,22 @@ class Flow:
         self._flow_cond = asyncio.Condition()
         self._log = _LogAdapter(logger, {"classname": "Flow"})
 
-    def add(
+    def add_job(self, processor: Processor, capacity=None, name=None):
+        """Adds a job processor to the flow"""
+        self.add_job_with_factory(stub_factory(processor), capacity, name)
+
+    def add_job_with_lock(
+        self,
+        processor: Processor,
+        resource_manager: ProcessorLock,
+        capacity=None,
+        name=None,
+    ):
+        self.add_job_with_factory(
+            stub_factory_lock(processor, resource_manager), capacity, name
+        )
+
+    def add_job_with_factory(
         self,
         processor_factory: ProcessorFactory,
         capacity=None,
@@ -59,7 +81,21 @@ class Flow:
         self._jobs.append(job)
         self._log.debug('Job "%s" added, cap: %s', job._name, str(job._cap))
 
-    def error(self, processor_factory, capacity=None, name="Error"):
+    def error(self, processor: Processor, capacity=None, name="Error"):
+        self.error_with_factory(stub_factory(processor), capacity, name)
+
+    def error_with_lock(
+        self,
+        processor: Processor,
+        resource_manager: ProcessorLock,
+        capacity=None,
+        name="Error",
+    ):
+        self.error_with_factory(
+            stub_factory_lock(processor, resource_manager), capacity, name
+        )
+
+    def error_with_factory(self, processor_factory, capacity=None, name="Error"):
         ejob = self._create_job(processor_factory, capacity, name)
         ejob._type = _Job.ERROR
         self._error_job = ejob

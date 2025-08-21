@@ -27,6 +27,32 @@ _Not yet published. Use `pip install .` locally from source._
 
 ---
 
+## 🏗️ Processor Scenarios
+
+1. **Processor**: A simple async callable that processes items directly.
+2. **Processor + Resource Lock**: This configuration allows for resource management during processing, useful for handling concurrent tasks safely.
+3. **ProcessorFactory**: A central factory that creates processors based on the required type or configuration, supporting both simple processing and more complex scenarios.
+
+Internally, the implementation can rely on the `ProcessorFactory` to support both the simple processor and the processor with resource locks, while the interface can accept any of these types.
+
+---
+
+## 🔧 Flow Class
+
+The `Flow` class manages the lifecycle and execution of connected jobs. It allows for the addition of jobs with various configurations and manages error handling effectively.
+
+### Key Methods:
+1. **add_job(processor, capacity=None, name=None)**: Adds a job processor to the flow.
+2. **add_job_with_lock(processor, resource_manager, capacity=None, name=None)**: Adds a job with a resource manager lock.
+3. **start()**: Starts the flow and its jobs. Handles the starting sequence and logs the process.
+4. **stop()**: Stops the flow and all jobs that have been started.
+5. **run()**: Coordinates job execution, waiting for all jobs to complete.
+
+### Error Handing:
+The `Flow` class allows for error jobs to be defined, which handle work rerouted due to exceptions in job processors. This ensures robustness and graceful handling of failures.
+
+---
+
 ## 🔧 Example
 
 ```python
@@ -180,7 +206,7 @@ Each job:
 
 Currently only one:
 
-- `Strategy.UTILIZATION`: Dynamically scales workers based on how busy they are
+- `Strategy.UTILIZATION`: Dynamically scales workers based on how busy they are.
 
 ---
 
@@ -199,5 +225,5 @@ MIT License. See `LICENSE`.
 
 ## 👤 Author
 
-**Andrey Maximov**  
+**Andrey Maximov**
 [GitHub](https://github.com/yourusername)
