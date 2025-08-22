@@ -1,4 +1,5 @@
-from .capacity import UtilizationCapacity
+from ._capacity import UtilizationCapacity
+
 
 class _UtilizationDecorator:
     def __init__(self, func, cap=UtilizationCapacity()):
@@ -16,9 +17,10 @@ class _UtilizationDecorator:
 
         return self.func(*margs, **kwargs)
 
-    def __get__(self, obj, objtype):
+    def __get__(self, obj, _):
         self.obj = obj
         return self
+
 
 def job_capacity(cap):
     def factory(func):
@@ -31,6 +33,7 @@ def job_capacity(cap):
 
     return factory
 
+
 def job_name(name):
     def factory(func):
         decorator = (
@@ -42,6 +45,7 @@ def job_name(name):
         return decorator
 
     return factory
+
 
 def workers(min_workers, max_workers=5, initial_workers=1):
     def factory(func):

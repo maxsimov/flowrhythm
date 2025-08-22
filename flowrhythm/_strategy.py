@@ -2,8 +2,9 @@ import asyncio
 import enum
 import logging
 
-from .capacity import UtilizationCapacity
-from .job import _Job, _JobState
+from _job import Job, JobState
+
+from ._capacity import UtilizationCapacity
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,7 @@ class _UtilizationStrategy:
     def default_capacity(self):
         return UtilizationCapacity()
 
-    async def __call__(self, job: _Job):
+    async def __call__(self, job: Job):
         last_ts = job.timestamp()
         while True:
             assert job._cap is UtilizationCapacity
@@ -29,7 +30,7 @@ class _UtilizationStrategy:
             while True:
                 await asyncio.sleep(job._cap.sampling)
                 async with job._state_cond:
-                    if job._state != _JobState.NORMAL:
+                    if job._state != JobState.NORMAL:
                         job._log.debug("scaling has been stopped due to last work item")
                         return
 
@@ -63,7 +64,7 @@ class _UtilizationStrategy:
                 upper_threshold_time = None
 
 
-def _strategy_factory(strategy):
+def strategy_factory(strategy):
     if strategy == Strategy.UTILIZATION:
         return _UtilizationStrategy()
     raise NotImplementedError()

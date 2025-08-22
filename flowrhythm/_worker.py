@@ -3,9 +3,9 @@ import logging
 from contextlib import contextmanager
 from typing import Optional
 
-from .exceptions import LastWorkItem, RouteToErrorQueue, StopProcessing
-from .job import _JobState
-from .logging import _LogAdapter
+from ._exceptions import LastWorkItem, RouteToErrorQueue, StopProcessing
+from ._job import JobState
+from ._logging import LogAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +24,13 @@ def set_manager(s, obj):
         s.discard(obj)
 
 
-class _Worker:
+class Worker:
     def __init__(self, name, i, job, processor):
         self._name = name
         self._id = i
         self._job = job
         self._task: Optional[asyncio.Task] = None
-        self._log = _LogAdapter(logger, {"classname": f"_Worker({self._name})"})
+        self._log = LogAdapter(logger, {"classname": f"_Worker({self._name})"})
         self._processor = processor
 
     def cancel(self):
@@ -43,10 +43,10 @@ class _Worker:
             try:
                 while True:
                     async with self._job._state_cond:
-                        if self._job._state != _JobState.NORMAL:
+                        if self._job._state != JobState.NORMAL:
                             if len(self._job._workers) != 1:
                                 raise _StopWorker("Job is closed -> stopping worker")
-                            if self._job._state == _JobState.EOW_RECEIVED:
+                            if self._job._state == JobState.EOW_RECEIVED:
                                 try:
                                     self._job._state_cond.release()
                                     w = await self._processor(self._job._last_work_item)
@@ -56,7 +56,7 @@ class _Worker:
                                     pass
                                 finally:
                                     await self._job._state_cond.acquire()
-                                self._job._state = _JobState.EOW_GENERATED
+                                self._job._state = JobState.EOW_GENERATED
 
                             try:
                                 self._job._state_cond.release()
@@ -103,8 +103,8 @@ class _Worker:
 
     async def _main_rx_last(self, work):
         async with self._job._state_cond:
-            if self._job._state == _JobState.NORMAL:
-                self._job._state = _JobState.EOW_RECEIVED
+            if self._job._state == JobState.NORMAL:
+                self._job._state = JobState.EOW_RECEIVED
                 self._job._state_cond.notify_all()
                 self._log.debug("main() received last work item")
                 if self._job._last_work_item is None:
@@ -117,7 +117,7 @@ class _Worker:
 
     async def _main_gen_last(self, work):
         async with self._job._state_cond:
-            self._job._state = _JobState.EOW_GENERATED
+            self._job._state = JobState.EOW_GENERATED
             self._job._state_cond.notify_all()
             self._log.debug("main() generated last work item")
             self._job._last_work_item = work
@@ -141,7 +141,7 @@ class _Worker:
         self._log.exception("main() unhandled exception in processor!")
         await self._main_processor_route_to_error(work)
 
-    def _main_completed(self, task):
+    def _main_completed(self, _):
         self._log.debug("_main_completed()")
         self._job._remove_worker(self)  # in case if task is destored before it started
 
@@ -153,7 +153,7 @@ class _Worker:
 
     async def get_work(self):
         async with self._job._state_cond:
-            if self._job._state != _JobState.NORMAL:
+            if self._job._state != JobState.NORMAL:
                 if len(self._job._workers) != 1:
                     raise _StopWorker("Stop workers")
 

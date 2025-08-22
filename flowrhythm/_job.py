@@ -3,26 +3,26 @@ import logging
 from enum import Enum, auto
 from typing import Optional
 
-from flowrhythm.capacity import UtilizationCapacity
+from ._capacity import UtilizationCapacity
 from flowrhythm.flow import Processor
 
-from .logging import _LogAdapter
-from .worker import _Worker
+from ._logging import LogAdapter
+from ._worker import Worker
 
 logger = logging.getLogger(__name__)
 
 
-class _JobState(Enum):
+class JobState(Enum):
     NORMAL = auto()
     EOW_RECEIVED = auto()
     EOW_GENERATED = auto()
 
 
-class _Job:
+class Job:
     NORMAL = 1
     ERROR = 2
     _input: Optional[asyncio.Queue]
-    _error_job: Optional["_Job"]
+    _error_job: Optional["Job"]
 
     def __init__(self, flow, processorFactory, cap: UtilizationCapacity):
         self._flow = flow
@@ -30,7 +30,7 @@ class _Job:
         self._processor: Optional[Processor] = None
         self._cap: UtilizationCapacity = cap
         self._name: Optional[str] = None
-        self._type = _Job.NORMAL
+        self._type = Job.NORMAL
         self._input = None
         self._output = None
         self._parent = None
@@ -41,14 +41,14 @@ class _Job:
         self._idle_workers = set()
         self._blocked_workers = set()
         self._started = asyncio.Event()
-        self._state = _JobState.NORMAL
+        self._state = JobState.NORMAL
         self._state_cond = asyncio.Condition()
         self._control_task = None
         self._target_workers = 0
         self._last_work_item = None
 
     async def start(self):
-        self._log = _LogAdapter(logger, {"classname": f"_Job({self._name})"})
+        self._log = LogAdapter(logger, {"classname": f"_Job({self._name})"})
         self._control_task = asyncio.create_task(self._control_worker())
         await self._started.wait()
 
@@ -112,7 +112,7 @@ class _Job:
     def _add_worker(self):
         assert self._processor is not None
         i = self._free_workers_id.pop()
-        worker = _Worker(f"{self._name}{i:02d}", i, self, self._processor)
+        worker = Worker(f"{self._name}{i:02d}", i, self, self._processor)
         self._workers.add(worker)
         worker._task = asyncio.create_task(worker.main())
         worker._task.add_done_callback(worker._main_completed)

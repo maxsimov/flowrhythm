@@ -4,11 +4,11 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncContextManager, Awaitable, Callable
 
-from .capacity import Statistics
-from .decorators import _UtilizationDecorator
-from .job import _Job
-from .logging import _LogAdapter
-from .strategy import Strategy, _strategy_factory
+from ._capacity import Statistics
+from ._decorators import _UtilizationDecorator
+from ._job import Job
+from ._logging import LogAdapter
+from ._strategy import Strategy, strategy_factory
 
 """
  factory:
@@ -39,7 +39,7 @@ async def stub_factory_lock(processor: Processor, resource_manager: ProcessorLoc
 
 class Flow:
     def __init__(self, strategy=Strategy.UTILIZATION):
-        self._strategy = _strategy_factory(strategy)
+        self._strategy = strategy_factory(strategy)
         self._jobid = 1
         self._jobs = []
         self._error_job = None
@@ -47,7 +47,7 @@ class Flow:
         self._end_seen = asyncio.Event()
         self._stats = Statistics()
         self._flow_cond = asyncio.Condition()
-        self._log = _LogAdapter(logger, {"classname": "Flow"})
+        self._log = LogAdapter(logger, {"classname": "Flow"})
 
     def add_job(self, processor: Processor, capacity=None, name=None):
         """Adds a job processor to the flow"""
@@ -97,7 +97,7 @@ class Flow:
 
     def error_with_factory(self, processor_factory, capacity=None, name="Error"):
         ejob = self._create_job(processor_factory, capacity, name)
-        ejob._type = _Job.ERROR
+        ejob._type = Job.ERROR
         self._error_job = ejob
         assert ejob._cap is not None
         ejob._input = asyncio.Queue(ejob._cap.queue_length)
@@ -176,7 +176,7 @@ class Flow:
         assert name is not None
         cap = cap or self._strategy.default_capacity()
         assert cap is not None
-        job = _Job(self, processor_factory, cap)
+        job = Job(self, processor_factory, cap)
         job._name = name
         job._flow = self
         return job
