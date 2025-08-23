@@ -1,1 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+.installed.cfg
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml
+
+# Test output
+.tox/
+.nox/
+
+# VSCode, PyCharm, etc.
+.vscode/
+.idea/
 .DS_Store
+
