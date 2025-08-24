@@ -247,4 +247,6 @@ MIT License. See `LICENSE`.
 ## 👤 Author
 
 **Andrey Maximov**
-[GitHub](https://github.com/yourusername)
+[GitHub](https://github.com/maxsimov)
+
+[![codecov](https://codecov.io/github/maxsimov/flowrhythm/graph/badge.svg?token=KRRENIJ5UF)](https://codecov.io/github/maxsimov/flowrhythm)
