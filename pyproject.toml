@@ -1,15 +1,12 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
-[project]
+[tool.poetry]
 name = "flowrhythm"
 version = "0.1.0"
 description = "Asynchronous job processing framework with dynamic worker scaling"
+authors = ["Andrey Maximov"]
 readme = "README.md"
-requires-python = ">=3.8"
-license = { text = "MIT" }
-authors = [{ name = "Andrey Maximov" }]
+license = "MIT"
+homepage = "https://github.com/maxsimov/flowrhythm"
+repository = "https://github.com/maxsimov/flowrhythm"
 keywords = ["asyncio", "pipeline", "worker pool", "scaling", "job processing"]
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -18,15 +15,20 @@ classifiers = [
   "Topic :: System :: Distributed Computing",
   "Topic :: Software Development :: Libraries",
 ]
+packages = [{ include = "flowrhythm" }]
 
-[project.urls]
-Homepage = "https://github.com/maxsimov/flowrhythm"
-Repository = "https://github.com/maxsimov/flowrhythm"
-Issues = "https://github.com/maxsimov/flowrhythm/issues"
+[tool.poetry.dependencies]
+python = ">=3.8"
 
-[tool.setuptools]
-packages = ["flowrhythm"]
-include-package-data = true
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-cov = "^5.0"
+pytest-asyncio = "^0.23"
+ruff = "^0.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
