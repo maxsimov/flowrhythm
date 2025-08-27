@@ -1,22 +1,17 @@
-import uuid
 from contextlib import asynccontextmanager
 from typing import (
     Any,
     AsyncContextManager,
     AsyncGenerator,
     Hashable,
-    Self,
     TypeVar,
     Union,
 )
 
 from flowrhythm._queue import fifo_queue
-from flowrhythm._scaling import FixedScaling, ScalingStrategy
 from flowrhythm._types import (
-    Branch,
     ErrorHandler,
     Producer,
-    Transformer,
 )
 
 

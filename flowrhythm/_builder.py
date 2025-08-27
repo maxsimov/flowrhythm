@@ -1,4 +1,4 @@
-from typing import Any, Dict, Hashable, List, Optional, Tuple, Protocol
+from typing import Any, Dict, Hashable, List, Optional, Protocol, Tuple
 
 from flowrhythm._types import Branch, Sink, Transformer
 
