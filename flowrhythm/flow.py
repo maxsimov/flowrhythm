@@ -1,45 +1,73 @@
+import uuid
+from contextlib import asynccontextmanager
 from typing import (
     Any,
     AsyncContextManager,
     AsyncGenerator,
-    Awaitable,
-    Callable,
-    Optional,
+    Hashable,
+    Self,
+    TypeVar,
     Union,
 )
 
-Producer = Callable[[], AsyncGenerator[Any, None]]
+from flowrhythm._queue import fifo_queue
+from flowrhythm._scaling import FixedScaling, ScalingStrategy
+from flowrhythm._types import (
+    Branch,
+    ErrorHandler,
+    Producer,
+    Transformer,
+)
 
-TransformerFn = Callable[[Any], Awaitable[Any]]
-TransformerCtx = AsyncContextManager[TransformerFn]
-Transformer = Union[TransformerFn, TransformerCtx]
 
-ConsumerFn = Callable[[Any], Awaitable[None]]
-ConsumerCtx = AsyncContextManager[ConsumerFn]
-Consumer = Union[ConsumerFn, ConsumerCtx]
+async def _default_producer() -> AsyncGenerator[Any, None]:
+    if False:
+        yield
 
-ErrorHandlerFn = Callable[[Any, Exception], Awaitable[None]]
-ErrorHandlerCtx = AsyncContextManager[ErrorHandlerFn]
-ErrorHandler = Union[ErrorHandlerFn, ErrorHandlerCtx]
+
+@asynccontextmanager
+async def _default_error_ctx():
+    async def identity(_item: Any, _exc: Exception) -> None:
+        pass
+
+    yield identity
+
+
+@asynccontextmanager
+async def _direct_link(id: Hashable):
+    async def identity(_) -> Hashable:
+        return id
+
+    yield identity
+
+
+T = TypeVar("T")
+
+
+def to_ctx(obj: Union[T, AsyncContextManager[T]]) -> AsyncContextManager[T]:
+    if isinstance(obj, AsyncContextManager):
+        return obj
+
+    @asynccontextmanager
+    async def ctx():
+        yield obj
+
+    return ctx()
+
+
+@asynccontextmanager
+async def _default_sink_ctx():
+    async def identity(_):
+        pass
+
+    yield identity
 
 
 class Flow:
-    def __init__(self) -> None:
-        pass
-
-    def set_producer(self, producer: Producer) -> None:
-        pass
-
-    def add_transformer(
-        self, transformer: Transformer, *, name: Optional[str] = None
-    ) -> None:
-        pass
-
-    def set_consumer(self, consumer: Consumer) -> None:
-        pass
-
-    def set_error_handler(self, handler: ErrorHandler) -> None:
-        pass
+    def __init__(self, *, queue_factory=fifo_queue) -> None:
+        self._queue_factory = queue_factory
+        self._producer: Producer = _default_producer
+        self._error: ErrorHandler = _default_error_ctx()
 
     async def start(self) -> None:
         pass

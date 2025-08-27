@@ -31,8 +31,8 @@ class ScalingStrategy(Protocol):
 
 
 class FixedScaling:
-    async def on_enqueue(self, _) -> int:
+    async def on_enqueue(self, stats: StageStats) -> int:
         return 0  # never scale (stub)
 
-    async def on_dequeue(self, _) -> int:
+    async def on_dequeue(self, stats: StageStats) -> int:
         return 0  # never scale (stub)

@@ -1,6 +1,7 @@
 import pytest
-from flowrhythm._utilizationscaling import UtilizationScaling
+
 from flowrhythm._scaling import StageStats
+from flowrhythm._utilizationscaling import UtilizationScaling
 
 
 def make_stats(busy_workers, idle_workers, **kwargs):

@@ -30,10 +30,10 @@ _Not yet published. Use `pip install .` locally from source._
 ## 🏗️ Basic Concepts
 
 ### **Producer**
-- An async generator (`async def`) that yields initial work items into the pipeline.
+- An asynchronous generator (`async def`) that yields initial work items into the pipeline. Please note that only one asynchronous worker is running as a producer.
 
 ### **Transformer**
-- An async function (`async def`) or async context manager that transforms each work item.
+- An async function (`async def`) or async context manager that transforms each work item. Multiple async workers are running per transformer, and they automatically scale.
 
 ### **Consumer**
 - An async function or async context manager that consumes final results (sink).
@@ -127,11 +127,14 @@ flow.add_transformer(transformer, scaling_strategy=strategy)
 | Method                  | Purpose                                                 |
 |-------------------------|--------------------------------------------------------|
 | `set_producer`          | Set async generator producing initial items            |
-| `add_transformer`       | Add a stage (async fn or context manager)              |
-| `set_consumer`          | Set sink (async fn or context manager)                 |
-| `set_error_handler`     | Set async fn or context manager for errors             |
+| `add_transformer`       | Add a stage (async function or context manager)        |
+| `set_consumer`          | Set sink (async function or context manager)           |
+| `set_error_handler`     | Set async function or context manager for errors       |
 | `set_default_scaling_strategy` | Set pipeline-wide scaling default              |
-| `start`, `wait`, `stop` | Control execution and lifecycle                        |
+| `start`                 | Start flow, this function spawns all async workers and returns immediately |
+| `join`                  | Await when flow completes its execution and flushes all queues |
+| `stop`                  | Aborts flow execution immediately, all downstream workers will be cancelled |
+| `run`                   | Start the flow and await when all jobs complete       |
 
 **Type signatures (stubs):**
 ```python
