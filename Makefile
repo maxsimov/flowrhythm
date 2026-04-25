@@ -1,10 +1,10 @@
 .PHONY: test cov lint clean
 
 test:
-	poetry run pytest
+	uv run pytest
 
 cov:
-	poetry run pytest --cov=flowrhythm tests/
+	uv run pytest --cov=flowrhythm tests/
 
 lint:
 	ruff flowrhythm tests
