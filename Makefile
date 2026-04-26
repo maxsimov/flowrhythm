@@ -7,7 +7,7 @@ cov:
 	uv run pytest --cov=flowrhythm tests/
 
 lint:
-	ruff flowrhythm tests
+	uv run ruff check flowrhythm tests
 
 clean:
 	rm -rf htmlcov .coverage flowrhythm.egg-info __pycache__ .pytest_cache

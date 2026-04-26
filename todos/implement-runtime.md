@@ -27,13 +27,15 @@ Goal: confirm that **stdlib `asyncio.Queue.shutdown()` (Python 3.13+)** does wha
 
 Key insight from research: `asyncio.Queue` got `shutdown(immediate=False)` and `shutdown(immediate=True)` in Python 3.13 — covering both graceful drain (`Flow.drain()`) and abort (`Flow.stop()`). LIFO and Priority variants inherit it. We bumped `requires-python = ">=3.13"` in `pyproject.toml`. No custom queue subclass needed.
 
-- [ ] Update existing queue factories (`fifo_queue`, `lifo_queue`, `priority_queue`) to default `maxsize=1`. They already return `asyncio.Queue` and variants, which now have `shutdown()` for free.
-- [ ] Tests covering the stdlib behavior we depend on:
-  - graceful shutdown: enqueue items, call `shutdown(immediate=False)`, verify get() returns remaining items then raises `QueueShutDown`
-  - immediate shutdown: enqueue items, call `shutdown(immediate=True)`, verify all blocked get() callers unblock with `QueueShutDown`
-  - put-after-shutdown raises
-  - multi-worker scenario: N workers awaiting get(), shutdown unblocks all of them
-  - works for LIFO and Priority too
+- [x] Update existing queue factories (`fifo_queue`, `lifo_queue`, `priority_queue`) to default `maxsize=1`. Done — `_queue.py` defaults `maxsize=1`; `AsyncQueueInterface` Protocol gained `shutdown(immediate)` method; module docstring added pointing to DESIGN.md.
+- [x] Tests covering the stdlib behavior we depend on. Done — `tests/test_queue.py` now has 30 tests (was 1), parametrised across all three queue types, covering:
+  - graceful shutdown drains remaining items then raises `QueueShutDown`
+  - put-after-shutdown raises immediately
+  - blocked `put()` callers unblock with `QueueShutDown` on shutdown
+  - immediate shutdown unblocks all waiting workers
+  - immediate shutdown drops queued items
+  - default `maxsize=1` blocks the second put
+- [x] Fixed Makefile `lint` target — was using stale `ruff flowrhythm tests` syntax; updated to `uv run ruff check flowrhythm tests`. `make lint` and `make cov` both pass; coverage at 98%.
 
 ### M1 — Minimum linear flow
 

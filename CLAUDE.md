@@ -105,6 +105,14 @@ There are three layers of documentation, each with its own audience:
 - Inline setup per test, no fixtures
 - Ruff for linting; ignores F841 (unused vars) and E701 (multiple statements)
 
+#### Async testing strategy
+- **Never use `wait_for(..., timeout=N)` to prove a coroutine "doesn't complete."** It costs N wall-clock per test and is flaky on slow CI. Use one of:
+  - **`x_nowait()` + matching exception** — `put_nowait()` / `QueueFull`, `get_nowait()` / `QueueEmpty`. Zero time, exact semantic match for "this would block."
+  - **State inspection** — `q.full()`, `q.qsize()`, `task.done()`. Cheaper than waiting; reads what's actually true.
+  - **Task introspection** — when you must prove "this coroutine is blocked": `task = asyncio.create_task(coro); await asyncio.sleep(0); assert not task.done(); task.cancel()`. The `sleep(0)` yields exactly one event-loop tick — long enough for tasks to reach their first await, no real time spent.
+- **`await asyncio.sleep(0)` is the canonical idiom for "let pending tasks reach their await point."** Use it (not `sleep(0.01)` or larger) when coordinating multiple tasks in a test.
+- **Time mocking** (freezegun, custom event loop) is only worth the setup cost when the *thing being tested* is time-based logic — e.g., `cooldown_seconds` or `sampling_period`. For "queue is full," "task is blocked," "shutdown unblocks waiters" — don't reach for time mocking; use the techniques above.
+
 ### Git
 - Conventional commits (`feat:`, `fix:`, `refactor:`, etc.)
 - Logical chunks — one commit per complete idea
