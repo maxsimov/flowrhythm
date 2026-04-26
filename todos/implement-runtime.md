@@ -57,19 +57,44 @@ Goal: `flow(t1, t2).run(source)` works for plain async functions, single-worker 
 
 Coverage: 97% on `_flow.py`, 98% overall. 45 tests pass in 0.03s. `make lint` clean.
 
-### M2 — Multi-worker stages and scaling
+### M2a — Multi-worker pool + drain cascade
 
-Goal: `FixedScaling(N)` and `UtilizationScaling` actually drive the worker pool. Close-cascade works with multi-worker stages.
+Goal: a stage can have N workers (configured at construction); the EOF cascade works correctly with N>1.
 
-- [ ] Per-stage worker pool wires up to `ScalingStrategy.on_enqueue` / `on_dequeue`
-- [ ] FixedScaling(N) → spawn N workers at startup
-- [ ] UtilizationScaling delta → spawn or stop workers accordingly
-- [ ] Multi-worker drain cascade: each worker exits naturally on `QueueShutDown`; per-stage tracker watches alive count → 0 to call `shutdown(immediate=False)` on downstream
-- [ ] Default queue size `maxsize=1` (per DESIGN.md)
-- [ ] `Flow.configure(name, scaling=..., queue=..., queue_size=...)` — per-stage tuning
-- [ ] `Flow.configure_default(scaling=..., queue=...)` — pipeline-wide defaults
-- [ ] `flow(*stages, default_scaling=..., default_queue=...)` — constructor kwarg shorthand
-- [ ] Tests: 4-worker stage processes items concurrently; drain cascade with N>1 finishes cleanly; UtilizationScaling adds/removes workers under load
+- [x] Refactor `_start_and_join()` to spawn N worker tasks per stage. Hidden `_workers_per_stage` kwarg on `flow()` for M2a-only testing; M2b replaces it with the public `configure()` API.
+- [x] Per-stage alive-worker counter (plain list of ints — asyncio is single-threaded cooperative). When count → 0, the worker that decremented closes the next queue.
+- [x] Workers exit naturally on `QueueShutDown`; `finally` block decrements the counter and (only when last) shuts down downstream.
+- [x] Smoke test: 4 workers per stage, 100 items, all arrive (sorted to handle out-of-order delivery)
+- [x] Test: parallelism observable — `max_in_flight > 1` with `_workers_per_stage=4`
+- [x] Test: drain cascade with N>1 doesn't hang; `run()` returns; items not lost
+- [x] Test: empty source with 8 workers per stage — all workers exit promptly
+- [x] Test: default behavior (no kwarg) → single worker per stage, M1 ordering preserved
+
+Coverage: 97% on `_flow.py`. 50 tests pass in 0.07s.
+
+### M2b — Configure API
+
+Goal: users can specify per-stage scaling/queue and pipeline-wide defaults; the M2a worker pool consumes those settings.
+
+- [ ] `Flow.configure(name, *, scaling=None, queue=None, queue_size=None)` — per-stage tuning; supports namespaced names like `"inner.decode"` (sub-flow names won't be resolvable until M7 but the storage shape should be ready)
+- [ ] `Flow.configure_default(*, scaling=None, queue=None, queue_size=None)` — pipeline-wide defaults
+- [ ] `flow(*stages, default_scaling=None, default_queue=None, default_queue_size=None)` — constructor kwargs equivalent to `configure_default`
+- [ ] At `run()` time, resolve effective config per stage: per-stage override → pipeline default → built-in default (`FixedScaling(1)`, `fifo_queue`, `maxsize=1`)
+- [ ] Update `FixedScaling` so it actually targets N workers (currently it returns 0 forever — a stub from the legacy code)
+- [ ] Test: `flow(...).configure(name, scaling=FixedScaling(4))` results in 4 workers for that stage
+- [ ] Test: `flow(*, default_scaling=FixedScaling(2))` applies to all stages
+- [ ] Test: per-stage override beats default
+- [ ] Test: configuring an unknown stage name — what happens? (Open question per DESIGN.md; for now: silently store, no error. Resolve later.)
+
+### M2c — UtilizationScaling integration
+
+Goal: `UtilizationScaling` (already implemented as a strategy) drives the worker pool dynamically based on `StageStats`.
+
+- [ ] Wire `ScalingStrategy.on_enqueue` and `on_dequeue` into the runtime — invoke after every enqueue/dequeue with the current `StageStats`; spawn or stop workers per the returned delta
+- [ ] Build `StageStats` snapshot from worker tracker (busy/idle counts, queue length, timestamps)
+- [ ] Test: `UtilizationScaling(min_workers=1, max_workers=8)` adds workers under sustained load and removes them when idle
+- [ ] Test: `min_workers=0` (scale-to-zero) — stage starts with 0, scales up on first item, scales back down when idle
+- [ ] Test: cooldown prevents flapping under bursty load
 
 ### M3 — CM factory transformers
 
