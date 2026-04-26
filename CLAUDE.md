@@ -78,6 +78,24 @@ There are three layers of documentation, each with its own audience:
 
 - Implemented plans stay as a record of what was decided and shipped. Never delete a plan file.
 
+## Asking questions (doubt protocol)
+
+When you hit a real ambiguity that needs a user decision (an API shape, a behavioral default, a trade-off between two equally valid designs):
+
+- **Number questions uniquely** when there's more than one open at once (Q1, Q2, …). Makes it easy for the user to answer in any order: "Q1: A. Q3: skip."
+- **Give 2–3 concrete options**, each with a short code/usage example so the user sees the call site, not just an abstract description.
+- **List pros/cons per option** on the axes that matter (UX, performance, complexity, maintenance burden, escape hatches).
+- **Recommend one with rationale.** Don't just present a menu — say which you'd pick and why. The user can override; defaulting to "you decide" is unhelpful.
+- **Wait for the answer before acting.** If the question is non-trivial, don't pre-emptively implement option A "to save time" — the rework cost when the user picks B is higher than the wait.
+
+Don't invoke the doubt protocol for trivial choices (variable names, comment phrasing, which file to put a one-off helper in). Pick a reasonable default and move on.
+
+## Milestone exit
+
+When the user signals that a milestone, phase, or chunk of work is complete (e.g. "M5 is done", "let's wrap up", "ready to commit"), read and execute [`docs/milestone-exit.md`](docs/milestone-exit.md). It's a checklist that gates code, aligns DESIGN ↔ README ↔ code, updates plans, and prepares the commit.
+
+Also useful before opening a PR or publishing a release.
+
 ## Conventions
 
 ### Typing & interfaces
