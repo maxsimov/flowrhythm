@@ -14,13 +14,25 @@ Pipeline DSL for chaining async stages (producer → transformers → sink) with
 
 ## Architecture
 
-- `flowrhythm/flow.py` — Core Flow orchestrator (wiring, lifecycle: start/wait/stop)
-- `flowrhythm/_builder.py` — Fluent DSL for constructing pipeline graphs
-- `flowrhythm/_stage.py` — Stage abstractions: SinkStage, TransformerStage, BranchStage
-- `flowrhythm/_scaling.py` — ScalingStrategy protocol, FixedScaling, StageStats
-- `flowrhythm/_utilizationscaling.py` — Utilization-based auto-scaling
-- `flowrhythm/_types.py` — Type aliases and protocols (Producer, Transformer, Sink, Branch, ErrorHandler)
-- `flowrhythm/_queue.py` — Queue factory (FIFO, LIFO, Priority)
+- Read README.md "Architecture" section before proposing any structural changes
+- Proposals must align with the design principles described there
+- Update README architecture diagrams when adding/removing/renaming components
+
+## README writing
+
+- README is the entry point for developers who have **never used this library before** and are not familiar with stream processing or async pipelines
+- Assume no prior context about flowrhythm or its design choices
+- For every constraint or non-obvious behavior, explain **why** it exists, not just what it is
+- For every limitation, give a **recommended workaround** with a worked example
+- **Always illustrate with concrete code examples** — shapes, signatures, and prose are not enough on their own
+- Prefer "Why? / What to do instead" subsections over single-line caveats
+
+## Roadmap
+
+- ROADMAP.md tracks decided design, open questions, and implementation backlog
+- Read it at the start of any non-trivial design or implementation work to know current state
+- Update it when: a design decision is made, an open question is resolved, work moves between backlog/done, or new work is identified
+- Move completed items to the "Done" section rather than deleting
 
 ## Conventions
 
@@ -52,4 +64,5 @@ Pipeline DSL for chaining async stages (producer → transformers → sink) with
 ### Git
 - Conventional commits (`feat:`, `fix:`, `refactor:`, etc.)
 - Logical chunks — one commit per complete idea
+- Never push unless all tests pass (`make test`)
 - Ask before significant rewrites of existing code

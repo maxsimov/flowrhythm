@@ -1,0 +1,195 @@
+# Roadmap
+
+Tracks design decisions, open questions, and implementation work for flowrhythm.
+
+---
+
+## Decided design
+
+### DSL
+- Single entry point: `flow(*stages)` — lowercase function, returns a `Flow` instance
+- `Flow` (uppercase class) is exported for type hints only — users always construct via `flow(...)`, never via `Flow(...)`
+- No separate `pipe()` / `Builder` concept — `flow()` is both structure and runnable
+- **`flow()` accepts only transformers** — passing an async generator at any position is an error; the producer is supplied separately via `run()`
+- Sink is **implicit** — the last stage in `flow()` plays the sink role when run autonomously (output dropped). The same flow used as a transformer in another flow forwards its last stage's output into the parent's downstream queue.
+- Stage names auto-derived from function names; collisions get numeric suffix; override via `stage(fn, name=...)`
+
+### Drive modes
+A `Flow` is symmetric — only how you drive it differs. Three modes, all on the same `Flow` instance:
+
+| Mode | API | Producer | Termination |
+|---|---|---|---|
+| **Bounded autonomous** | `await chain.run(producer)` | Caller passes async generator (or CM factory yielding one) | Producer exhausts → drain → exit |
+| **Unbounded autonomous** | `await chain.run()` | Framework auto-emits `None` signals indefinitely | External `chain.stop()` or first stage raises |
+| **Push** | `async with chain: await chain.send(item)` | Caller is the producer | `complete()` (explicit or via `async with` exit) |
+
+The mode is **selected by the call**:
+- Calling `run()` locks the flow into autonomous mode
+- Entering `async with chain` locks it into push mode
+- Calling `send()` outside `async with` raises
+- Calling `run()` while inside `async with` raises
+
+`stop()` is always available for graceful shutdown regardless of mode.
+
+### Routing
+- `router(classifier, **arms, default=...)` — branching as a regular transformer
+- If classifier returns unknown label and no `default`, raises `ValueError`
+- Arms can be any Transformer (callable, chain, Flow)
+
+### Composability
+- A `Flow` plugs into another `flow()` as a stage
+- Sub-flows are first-class — framework discriminates them for diagnostics
+
+### Transformer (tagged union)
+A Transformer is one of three concrete kinds:
+1. `Flow` — a sub-pipeline (introspectable for `dump()`, etc.)
+2. `AsyncContextManager[Callable]` — for resources that need acquire/release
+3. `Callable[[item], Awaitable[item]]` — plain async function
+
+Plus `router(...)` results, which are also first-class for introspection.
+
+### Async-only
+- All transformers and context managers must be async (`async def`, `AsyncContextManager`)
+- Sync code is rejected at construction with a clear error pointing to `asyncio.to_thread` or the `sync_stage()` helper
+- Rationale: library is asyncio-native and orchestrates external work; sync blocks the event loop and defeats the purpose
+
+### Resource scope
+- Async context managers are **per-worker** — each worker enters its own context on startup, exits on shutdown
+- Context lifecycle = worker lifecycle. Resources are acquired lazily as workers spawn, released as workers exit.
+- Scale-to-zero is supported. When the last worker exits, the resource is released. First item after a `0→1` transition pays the acquire cost.
+- Shared resources (pools, models) are managed outside the framework
+
+### AsyncContextManager Transformer shape
+A context-managed transformer is a **factory** — a no-arg callable that returns a fresh `AsyncContextManager` whose `__aenter__` yields the actual transformer callable. The framework calls the factory once per worker.
+
+```python
+TransformerFn  = Callable[[Any], Awaitable[Any]]
+TransformerCMF = Callable[[], AsyncContextManager[TransformerFn]]
+```
+
+Accepted forms:
+- `@asynccontextmanager`-decorated function (most common)
+- A class whose constructor takes no args and which implements `__aenter__`/`__aexit__` — instantiated as `cls()` per worker
+- Any callable matching the factory shape (e.g., `lambda: MyT(args)`)
+
+Per-worker state without resource lifecycle: yield a closure capturing local state from the CM body. No special case needed.
+
+**Producer as CM** is also supported — single producer means single CM entered once. Same factory shape, but the inner yielded value is an async generator (or async fetcher).
+
+### Stage role detection
+At construction, `flow()` validates each stage. Async generators are rejected — they belong to `run()` as the producer, not in the chain.
+
+```python
+if inspect.isasyncgenfunction(stage):
+    raise TypeError("flow() does not accept async generators; pass producers to run() instead")
+elif isinstance(stage, Flow):           shape = subflow
+elif isinstance(stage, Router):         shape = router
+elif callable(stage):
+    n = len(inspect.signature(stage).parameters)
+    if n == 0:   shape = ctx_factory   # 0 args → returns AsyncContextManager
+    elif n == 1: shape = transformer   # 1 arg → takes item
+    else:        raise TypeError(...)
+```
+
+Sync functions and sync context managers are rejected with a clear error pointing to `asyncio.to_thread` or `sync_stage()`.
+
+The **last stage** in `flow()` plays the sink role when run autonomously — its output is dropped. When the same flow is used as a transformer in another flow, the last stage's output is forwarded to the parent's downstream queue. No marking required.
+
+### Scaling
+- **Producers** always have exactly one worker (cannot scale). Async generators are not safe to consume concurrently — duplicates or races.
+- For parallel ingestion (Kafka consumer, paginated API), use a trigger producer + multi-worker transformer pattern:
+  ```python
+  async def trigger():
+      while True: yield None
+  async def fetch(_): return await kafka.poll()
+  main = flow(trigger, fetch, ...)
+  main.configure("fetch", scaling=UtilizationScaling(min_workers=4))
+  ```
+- **Transformers and sinks** can scale, including `min_workers=0` (scale-to-zero)
+- Default scaling: `FixedScaling(workers=1)` if no configuration is provided
+- `FixedScaling(workers=N)` requires `N >= 1` (it's fixed, not elastic — use `UtilizationScaling` for scale-to-zero)
+- `UtilizationScaling(min_workers=M)` allows `M >= 0`
+- Validation at construction; raise `ValueError` on invalid combinations
+
+### Configuration (separate from definition)
+- `flow.configure(name, scaling=..., queue=...)` — per-stage tuning
+- `flow.configure_default(scaling=..., queue=...)` — pipeline-wide defaults
+- `flow.set_error_handler(handler)` — one per pipeline, last resort
+
+### Architecture rules
+- Stream processing pipeline, not a workflow engine
+- DAG only — no cycles, all paths terminate at sink
+- Orchestrator, not a worker — coordinates external heavy work, not CPU-bound Python computation
+- Retry/iteration belongs inside a stage, not in graph topology
+
+### Error handling
+- Two layers: handle inside transformer (preferred), pipeline error sink (last resort)
+- Built-in exceptions only — no custom hierarchy
+
+### Lifecycle
+- `flow.run()` — run to completion
+- `flow.start()` / `flow.join()` / `flow.stop()` — manual control
+
+### Queue type
+- Pipeline-wide default + per-stage override
+- Built-in: `fifo_queue`, `lifo_queue`, `priority_queue`
+
+---
+
+## Open questions
+
+- **`configure()` validation** — warn if user configures a stage name that doesn't exist in the flow?
+- **Backpressure** — what's the bounded queue size default? How does it interact with auto-scaling?
+- **Multi-source producers** — single worker per producer is decided. If a user needs multi-source ingestion, do they merge upstream (router-style), run multiple flows, or do we add parallel producers?
+- **`dump()` output format** — JSON, mermaid, plain text, or all three?
+- **Per-stage error handling** — currently pipeline-only. Useful to override per stage, or keep simple?
+
+## Future enhancements (deferred)
+
+- **`source(fn)` for multi-worker producers** — explicit primitive for "fetcher" style producers (Kafka consumer, SQS poller, paginated API). Each worker calls `fn()` independently to fetch one item; multiple workers parallelize ingestion. Termination via raised `StopAsyncIteration` or sentinel return. Defer until trigger+transformer pattern proves insufficient.
+- **`merge(*sources)` helper** — combine multiple async generators into one for use as a single producer.
+
+---
+
+## Implementation backlog
+
+### Core migration (current code uses `Builder` DSL, README documents `flow()`)
+- [ ] Replace `_builder.py` with `flow()` function
+- [ ] Implement role detection (async generator → producer; last stage → sink)
+- [ ] Implement auto-naming + collision suffixing
+- [ ] Implement `stage(fn, name=...)` wrapper
+- [ ] Implement `router(classifier, **arms, default=...)`
+- [ ] Make `Flow` introspectable as a transformer
+- [ ] Update `__init__.py` exports: `flow`, `router`, `stage`, `Flow`, scaling classes, queue factories
+
+### Flow runtime
+- [ ] Implement `Flow.start() / join() / stop() / run()`
+- [ ] Wire scaling strategies to actual worker spawn/kill
+- [ ] Implement per-worker async context manager lifecycle
+- [ ] Implement `Flow.configure() / configure_default()`
+- [ ] Implement `Flow.set_error_handler()`
+
+### Diagnostics
+- [ ] Implement `Flow.dump()` — structure mode (graph as text/mermaid)
+- [ ] Implement `Flow.dump()` — stats mode (live runtime stats)
+
+### Tests
+- [ ] `tests/test_builder.py` is currently skipped at module level (Builder DSL is being replaced) — rewrite against `flow()` API once it exists
+- [ ] Add tests for sub-flow composition
+- [ ] Add tests for router (incl. default and unknown-label-raises)
+- [ ] Add tests for per-worker context manager scope
+- [ ] Add tests for `run(producer)`, `run()` (auto-trigger), `async with` + `send()` push mode
+- [ ] Add tests for "async generator passed to flow() raises TypeError"
+
+### Polish
+- [ ] Implement `sync_stage(fn)` helper — wraps a sync function with `asyncio.to_thread` so users can opt into running sync code as a transformer
+- [ ] Fix mutable-default bug in `_builder.py` (`_Branch.options`, `_Branch.arm`) — moot if `_builder.py` is replaced
+- [ ] Decide on Python target (currently `>=3.12` per `pyproject.toml`)
+
+---
+
+## Done
+
+- Migrated build system from Poetry to uv/hatchling
+- Created CLAUDE.md with project conventions
+- Drafted README with new `flow()` DSL design
