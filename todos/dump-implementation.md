@@ -33,7 +33,8 @@ Depends on: `migrate-to-flow.md` (need the flow graph and stats infrastructure f
 
 ### Stats mode
 
-- [ ] Per-stage `StageStats` snapshot: stage name, busy/idle worker counts, queue length, recent throughput
+- [ ] Per-stage `StageStats` snapshot: stage name, busy/idle worker counts, queue length, queue open/closed status, recent throughput
+- [ ] Per-stage worker-state breakdown: count of workers in each of `waiting_input` / `processing` / `waiting_output` (per DESIGN.md "Worker states"). Diagnoses stalls (e.g., "all workers `waiting_output`" → downstream bottleneck)
 - [ ] Aggregate top-line: total items in flight, total items processed, total errors, drops by reason
 - [ ] Time since last item processed (for spotting stalls)
 - [ ] Optional: include scaling strategy state (cooldown remaining, etc.)

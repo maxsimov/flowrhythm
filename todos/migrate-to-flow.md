@@ -26,7 +26,7 @@ See `DESIGN.md` for the design that this implements.
 - [ ] Stage role detection per DESIGN.md "Stage role detection" section — reject async generators with clear `TypeError`, dispatch by signature inspection
 - [ ] Auto-derive stage names from function names; numeric suffix on collisions
 - [ ] Reject sync functions and sync context managers with error pointing to `asyncio.to_thread` or `sync_stage()` helper
-- [ ] Sub-flow expansion — when a `Flow` is in another `flow()` args, inline its stages with namespaced names (`inner.stage_name`)
+- [ ] Sub-flow expansion — implement the inlining algorithm per DESIGN.md "Composition (sub-flows) → Inlining algorithm": (1) pick prefix from `stage(inner, name="...")` or fallback `_subflow_N`, (2) expand sub-stages with `<prefix>.<sub>` names, (3) carry over the sub-flow's per-stage config under prefixed names, (4) recurse for nested sub-flows. Configuration merge order: most-specific wins (parent's `configure()` overrides sub-flow's pre-existing config).
 - [ ] Router arm expansion — each arm becomes a sub-graph in the parent
 
 ### Runtime
@@ -35,15 +35,15 @@ See `DESIGN.md` for the design that this implements.
 - [ ] Per-stage worker pool — spawn N workers based on scaling strategy
 - [ ] Per-worker async context manager lifecycle (acquire on spawn, release on stop)
 - [ ] Wire `ScalingStrategy.on_enqueue` / `on_dequeue` to actual worker spawn/kill
-- [ ] Bounded queue between stages (default size — see DESIGN.md open question on backpressure)
-- [ ] EOF/drain cascade — close-style queue OR N-sentinel approach (see DESIGN.md)
+- [ ] Bounded queue between stages — default `maxsize=1` (per DESIGN.md "Queue size and backpressure"); override via `chain.configure(name, queue_size=N)`
+- [ ] EOF/drain cascade — close-style queue per DESIGN.md "EOF / drain cascade"; implement closeable subclass of `asyncio.Queue` (and LIFO/Priority variants) with `close()`/`QueueClosed`. Track per-worker state (`waiting_input` / `processing` / `waiting_output`) for `dump()`.
 - [ ] `Last(value)` handling — output `value`, then close upstream queue, drop in-flight upstream items as `Dropped(..., UPSTREAM_TERMINATED)`
 
 ### Activation modes
 
 - [ ] `Flow.run(source)` — bounded; consume async generator with one task; close on exhaustion
 - [ ] `Flow.run(source)` — reject already-instantiated generators (`isinstance` check); raise `TypeError` with helpful message: "pass the generator function, not the called generator. e.g., chain.run(my_items) not chain.run(my_items())"
-- [ ] `Flow.run()` — unbounded; auto-emit `None` to first stage; runs until `stop()`/`drain()`
+- [ ] `Flow.run()` — unbounded; tight loop `await first_queue.put(None)` (per DESIGN.md "Auto-emit rate" — backpressure from `maxsize=1` throttles naturally, no timing logic needed); runs until `stop()`/`drain()`
 - [ ] `Flow.run(source)` for CM-factory source — call factory, enter context, iterate inner generator
 - [ ] `Flow.push()` — return `AsyncContextManager[PushHandle]`
 - [ ] `PushHandle.send(item)` — enqueue to first stage's queue (blocks if full)

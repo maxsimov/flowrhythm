@@ -40,6 +40,13 @@ A `Flow` is symmetric — only how you activate it differs. Three modes, all on 
 #### Why a separate PushHandle type
 `send()` only makes sense when the flow has been activated in push mode. If `send()` lived on `Flow`, users could call it before (or instead of) entering `chain.push()`, requiring runtime mode-locking and producing confusing errors. Returning a separate `PushHandle` type from `chain.push()` makes the type system enforce the rule — `Flow` has no `send()` method, so the mistake is structurally impossible. No runtime mode tracking, no wrong-mode exceptions, no docs to read.
 
+#### Auto-emit rate (unbounded `run()`)
+The unbounded mode is implemented as a tight loop putting `None` into the first stage's queue. Because the default queue size is 1, `put()` blocks until the previous `None` has been consumed — backpressure naturally throttles emission. Result: emission rate = whatever the first stage can sustain.
+
+No special timing logic, no rate config. Users who want different behavior have two levers:
+- **Burstier emission** — `chain.configure("first_stage", queue_size=N)` lets the framework buffer N `None`s ahead
+- **Rate-limited emission** — add `await asyncio.sleep(...)` inside the user's first transformer (the fetcher)
+
 ### Routing
 - `router(classifier, **arms, default=...)` — branching as a regular transformer
 - If classifier returns unknown label and no `default`, raises `ValueError`
@@ -88,15 +95,41 @@ Per-worker state without resource lifecycle: yield a closure capturing local sta
 ### Composition (sub-flows)
 Composing a `Flow` into another `flow()` is **graph-level inlining**, not a function call. The sub-flow's stages are stitched into the parent's pipeline graph; each retains its own queue, worker pool, scaling strategy, and configuration. No correlation, no per-item return value — items flow queue-to-queue.
 
-Naming under composition:
-- Sub-flow stages are namespaced with the sub-flow's stage name in the parent: `inner.decode`, `inner.validate`
-- Parent can override: `outer.configure("inner.decode", scaling=...)`
-- Sub-flow's pre-existing config stays in effect unless overridden
-- Recursion works: a sub-flow can contain sub-flows; names compose dotted (`outer.inner.deeper`)
+The same `Flow` definition works **standalone** (`await inner.run(source)`) or **composed** (`flow(parent_stage, inner, sink)`) — its behavior is identical in both cases. There is no "transformer mode" vs "standalone mode."
 
-The same `Flow` definition works **standalone** (`await inner.run(producer)`) or **composed** (`flow(parent_stage, inner, sink)`) — its behavior is identical in both cases. There is no "transformer mode" vs "standalone mode."
+`Flow` is therefore **not a Transformer** in the call-shape sense. It is a sub-pipeline that the framework expands during construction. The Transformer call-shape protocol applies only to plain async functions, CM factories, and `Router`.
 
-`Flow` is therefore **not a Transformer** in the call-shape sense. It is a graph fragment that the framework expands during construction. The Transformer call-shape protocol applies only to plain async functions, CM factories, and `Router`.
+#### Inlining algorithm
+
+When `flow(stages...)` encounters a `Flow` in its args, it expands that sub-flow into the parent's stage list at construction time:
+
+1. **Pick a name for the sub-flow** (call it the *prefix*)
+   - Preferred: `stage(inner, name="ingest")` — explicit, clear, stable
+   - Fallback: if user passes the sub-flow without `stage(..., name=...)`, framework assigns `_subflow_N` (where N is the sub-flow's positional index in the parent). Functional but ugly — docs recommend the explicit form.
+2. **Expand each sub-stage** into the parent's stage list, with name prefixed: `<prefix>.<sub_stage_name>` (e.g., `ingest.decode`, `ingest.validate`)
+3. **Carry over per-stage configuration** from the sub-flow into the parent's config map under the prefixed names
+4. **Recurse** — a sub-flow inside a sub-flow expands the same way; names compose dotted (`outer.middle.inner.stage`)
+
+#### Configuration merge order
+
+When the same prefixed stage name has configuration from both the sub-flow and the parent, **the most-specific override wins** (parent's explicit `configure()` beats the sub-flow's pre-existing config):
+
+```python
+inner.configure("decode", scaling=FixedScaling(workers=4))      # set on inner
+outer = flow(stage(inner, name="x"), sink)
+outer.configure("x.decode", scaling=FixedScaling(workers=8))    # overrides inner
+# Effective: x.decode runs with workers=8
+```
+
+If the parent doesn't override, the sub-flow's config carries through unchanged. Order: standard "most-specific wins" pattern (matches CSS, layered config files, etc.).
+
+#### Name collisions
+
+Top-level stages and sub-stages live in different namespaces, so collision is impossible by construction:
+- `outer.normalize` (top-level) and `outer.x.normalize` (inside sub-flow `x`) are different addresses
+- Two sub-flows wrapped under different names (`stage(s1, name="a")`, `stage(s2, name="b")`) get `a.normalize` and `b.normalize` — also different addresses
+
+The only collision case is **two unwrapped sub-flows** at the same level (both falling back to `_subflow_N`) — distinct because of the index. No special-case logic needed.
 
 ### Stage role detection
 At construction, `flow()` validates each stage. Async generators are rejected — they belong to `run()` as the producer, not in the chain.
@@ -208,6 +241,44 @@ class Dropped:
 - Pipeline-wide default + per-stage override
 - Built-in: `fifo_queue`, `lifo_queue`, `priority_queue`
 
+### Queue size and backpressure
+- **Default `maxsize=1`** for every stage's input queue
+- Rationale: aggressive backpressure pairs naturally with `UtilizationScaling` (queue length swings between 0 and 1; scaling decisions key off worker utilization, not buffer growth) and keeps memory predictable (N stages × N workers × 1)
+- A stalled downstream is visible as "everything blocked" within one item, not after a hundred buffered ones — early signal that something is off
+- Per-stage override available via `chain.configure(name, queue_size=N)` for stages where bursty buffering genuinely helps
+- Unbounded queues (`maxsize=0`) are NOT a default — must be explicitly opted into per stage; comes with OOM risk if downstream stalls
+
+### EOF / drain cascade
+End-of-stream propagates through the pipeline by **closing queues**, not by emitting sentinel items. Queues are closeable: a custom subclass of `asyncio.Queue` (and the LIFO/Priority variants) adds `close()`. After `close()`:
+- `get()` returns any remaining items first; once the queue is empty AND closed, `get()` raises `QueueClosed`
+- `put()` raises immediately
+
+The cascade:
+1. Trigger event happens (source generator returns; `Last(value)` returned by a transformer; `chain.drain()` called)
+2. Framework calls `close()` on the affected queue (source's destination, the stage after `Last`'s output, etc.)
+3. Workers naturally drain remaining items, then their next `get()` raises and they exit
+4. Each stage's tracker watches its alive worker count; when count drops to 0, the stage's downstream queue is closed
+5. Cascade continues until the last stage exits
+
+No item is dropped during a drain — everything queued at the moment of `close()` is still processed. In-flight items in workers complete normally.
+
+#### Worker states (useful for `dump()` and debugging)
+At any moment, a worker is in one of three states:
+
+| State | What the worker is doing | Affected by input-queue `close()`? |
+|---|---|---|
+| **`waiting_input`** | Blocked on `my_queue.get()` | Yes — get returns remaining items, then raises `QueueClosed` once empty |
+| **`processing`** | Awaiting the user's transformer (`await fn(item)`) | No — current item always completes |
+| **`waiting_output`** | Blocked on `next_queue.put(result)` | No — next queue isn't closed yet (this worker is still alive) |
+
+`dump(mode="stats")` should expose per-stage counts of workers in each state, plus the queue's open/closed status, so users can diagnose stalls (e.g., "8 workers all `waiting_output`" → downstream is the bottleneck).
+
+#### Race-free against scaling
+- Workers exit independently — no per-stage worker counter for the cascade to track (the per-stage tracker only watches "alive count → 0")
+- Scaling strategy is told "input closing" so it stops scaling up (down-scaling is fine; workers exit anyway)
+- A worker spawned mid-drain immediately hits `get()` and either picks an in-flight item or exits cleanly — no hang, no leak
+- A worker mid-`put()` to a downstream queue is unaffected; downstream queue closes only after this stage finishes
+
 ### Component class diagram
 
 The full type structure: factory functions, the `Flow` and `Router` classes, the `PushHandle` returned from push mode, the `Transformer` duck-typed shape, and the `ScalingStrategy` protocol with built-in implementations.
@@ -291,7 +362,6 @@ classDiagram
 ## Open questions
 
 - **`configure()` validation** — warn if user configures a stage name that doesn't exist in the flow?
-- **Backpressure** — what's the bounded queue size default? How does it interact with auto-scaling?
 - **Multi-source producers** — single worker per producer is decided. If a user needs multi-source ingestion, do they merge upstream (router-style), run multiple flows, or do we add parallel producers?
 - **`dump()` output format** — JSON, mermaid, plain text, or all three?
 - **Per-stage error handling** — currently pipeline-only. Useful to override per stage, or keep simple?
