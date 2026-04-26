@@ -19,17 +19,12 @@ _Not yet published. Use `pip install .` locally from source._
 
 ## Quick Start
 
-A flow defines the **processing chain**. The producer is supplied separately when you run it. This separation lets the same chain run against different sources (file, stream, push from web handler) without changing its definition.
+A `flow` is a chain of async stages. The last stage consumes (the "sink"). You activate the chain in one of several ways — passing a source generator to `run()`, pushing items in via `push()`, or letting the framework drive it. See [Driving a flow](#driving-a-flow) for all options.
 
 ```python
 from flowrhythm import flow, router
 
-# Producer — separate from the chain
-async def reader():
-    for i in range(100):
-        yield i
-
-# Chain stages — transformers and the final sink
+# Stages — transformers and the final sink
 async def normalize(x):       return x * 2
 async def quick(x):           return x + 1
 async def heavy(x):           return x ** 2
@@ -40,23 +35,22 @@ async def classify(x):        return "fast" if x < 50 else "slow"
 chain = flow(
     normalize,
     router(classify, fast=quick, slow=heavy),
-    db_write,                     # last stage — implicit sink when run autonomously
+    db_write,
 )
 
-# Drive it
-await chain.run(reader)           # bounded — producer drives until exhausted
+# Activate it — here, by feeding a source of items
+async def items():
+    for i in range(100):
+        yield i
+
+await chain.run(items)
 ```
 
 ---
 
 ## Stages
 
-A flow is a sequence of **transformers**. The producer is not part of the flow — it's supplied to `run()`. The last stage in the flow plays the **sink** role when run autonomously: its output is dropped. When the same flow is composed inside another flow as a sub-stage, the last stage's output is forwarded into the parent's downstream queue.
-
-Roles are determined by **position and how the flow is driven**:
-- Every stage in `flow()` is a transformer
-- The last stage acts as a sink in autonomous mode (`run()`), or as the chain's output when composed
-- Producers are passed to `run()`, never inside `flow()`
+A flow is a sequence of **stages**. Items enter at the first stage's input queue, flow through each stage, and the last stage consumes them (the **sink**). Where items come from is decided when you activate the flow — see [Driving a flow](#driving-a-flow).
 
 ### What's inside a stage
 
@@ -71,102 +65,41 @@ A queue lives **between** two stages. The downstream stage owns it. Configuring 
                                     ┌─ stage owns input queue ─┐
                                     │                          │
                                     ▼                          ▼
-   ┌──────────┐   queue1   ┌──────────────┐   queue2   ┌──────────────┐   queue3   ┌──────┐
-   │ producer │ ─────────▶ │ transformer1 │ ─────────▶ │ transformer2 │ ─────────▶ │ sink │
-   │ (1 wkr)  │            │   (N wkrs)   │            │   (M wkrs)   │            │(K wkr)│
-   └──────────┘            └──────────────┘            └──────────────┘            └──────┘
-                              │   │   │
-                              ▼   ▼   ▼
-                          scaling strategy
+   ┌──────────────┐   queue1   ┌──────────────┐   queue2   ┌──────────────┐   queue3   ┌──────┐
+   │ item source  │ ─────────▶ │ transformer1 │ ─────────▶ │ transformer2 │ ─────────▶ │ sink │
+   │ (external)   │            │   (N wkrs)   │            │   (M wkrs)   │            │(K wkr)│
+   └──────────────┘            └──────────────┘            └──────────────┘            └──────┘
+                                  │   │   │
+                                  ▼   ▼   ▼
+                              scaling strategy
 ```
 
-- 4 stages → 3 queues
-- `queue1` is transformer1's input (and producer's destination)
-- `queue2` is transformer2's input (and transformer1's destination)
+- 3 stages → 3 queues (one fronts each stage; the source feeds queue1)
+- `queue1` is transformer1's input (and the item source's destination)
 - `queue3` is sink's input (and transformer2's destination)
-- Producer has no input queue (generates items); sink has no output queue (terminal)
+- Sink has no output queue — items terminate there
+
+The **item source** is external to the flow. It's whatever drives items into queue1 — see [Driving a flow](#driving-a-flow).
 
 > **Async-only.** All stages must be async. Sync functions and sync context managers are rejected at construction. For sync code, wrap with `asyncio.to_thread` or use the `sync_stage()` helper (see [Public API](#public-api)).
 
-### Producer (passed to `run()`)
-
-The source of items. Not part of the chain definition — supplied as an argument to `run()`. **Always one worker (cannot scale).**
-
-#### Why one worker?
-
-A producer is an async generator. Async generators hold internal iteration state (where in the loop, last value yielded). They cannot be safely consumed by multiple workers:
-
-- **Two workers calling the generator function** → each gets its own independent generator → both yield the *same* sequence → duplicates downstream.
-- **Two workers sharing one generator instance** → race conditions on the iteration state → undefined behavior, lost or repeated items.
-
-Either way, parallelism at the producer breaks pipeline correctness. So flowrhythm forces exactly one producer worker.
-
-| Shape you write | When to use |
-|---|---|
-| `async def f():` ... `yield item` | Simple sources — file reader, range, in-memory queue |
-| Factory returning `AsyncContextManager` whose `__aenter__` returns an async generator | Sources that need resource lifecycle (open connection, then stream) |
-
-Examples:
-```python
-# Plain async generator
-async def reader():
-    for i in range(100):
-        yield i
-
-await chain.run(reader)
-
-# CM factory — opens a resource, then streams from it
-@asynccontextmanager
-async def kafka_source():
-    consumer = await connect_kafka()
-    async def gen():
-        async for msg in consumer:
-            yield msg
-    yield gen()
-    await consumer.close()
-
-await chain.run(kafka_source)
-```
-
-> **Producers do not go inside `flow(...)`.** Passing an async generator as a flow stage raises `TypeError`. They are sources and belong to `run()`.
-
-#### What if I need parallel ingestion?
-
-If your bottleneck is fetching items from an external source (Kafka with high throughput, paginated API with many pages, SQS poller), don't try to scale the producer — keep it minimal and put the parallelism in a **fetcher transformer**:
-
-**Option 1: explicit producer + fetcher transformer**
-```python
-async def trigger():
-    while True:
-        yield None              # one signal per fetch attempt
-
-async def fetch_message(_):
-    return await kafka.poll()   # external state; safe to call from N workers
-
-chain = flow(fetch_message, normalize, db_write)
-chain.configure("fetch_message", scaling=UtilizationScaling(min_workers=4, max_workers=32))
-await chain.run(trigger)
-```
-
-**Option 2: omit the producer; framework auto-emits None**
-```python
-chain = flow(fetch_message, normalize, db_write)
-chain.configure("fetch_message", scaling=UtilizationScaling(min_workers=4, max_workers=32))
-await chain.run()              # no producer arg → framework emits None forever
-```
-
-Same outcome, less boilerplate. Either way, the fetcher stage scales to as many workers as you need; each calls the external source independently.
-
 ### Transformer
 
-A middle stage. Takes one item, returns one item. Multiple workers, auto-scaled (including scale-to-zero).
+A middle stage. Multiple workers, auto-scaled (including scale-to-zero).
+
+There are two **call-shape transformers** (single-stage units the framework invokes per item):
 
 | Shape you write | When to use |
 |---|---|
 | `async def f(x) -> y` | Simple stateless processing — parse, transform, enrich |
 | Factory `() -> AsyncContextManager` whose `__aenter__` returns an `async def fn(x) -> y` | Per-worker resource lifecycle — subprocess, DB connection, HTTP session |
-| A `Flow` (from `flow(...)` without a sink) | Reuse a sub-pipeline as one stage |
-| A `Router` (from `router(...)`) | Branching to one of several arms |
+
+And two **graph fragments** (multi-stage units that get inlined into the parent's pipeline graph):
+
+| Shape you write | What happens |
+|---|---|
+| A `Flow` (from `flow(...)`) | Sub-flow's stages are stitched into the parent's graph; each keeps its own queue + workers + scaling |
+| A `Router` (from `router(...)`) | Each arm becomes a sub-graph; classifier dispatches items to the chosen arm's input queue |
 
 Examples:
 ```python
@@ -193,15 +126,18 @@ class WithDB:
     async def __aexit__(self, *exc):
         await self.db.close()
 
-# Sub-flow — composed
+# Sub-flow — graph fragment, gets inlined when composed
 heavy_path = flow(decode, heavy)
+heavy_path.configure("decode", scaling=UtilizationScaling(min_workers=2, max_workers=8))
 
-# Router — branching
+# Router — graph fragment with branching arms
 splitter = router(classify, fast=quick, slow=heavy_path)
 
 chain = flow(normalize, with_db, splitter, db_write)
 await chain.run(reader)
 ```
+
+> **Sub-flows are not function calls.** When you put a `Flow` into another `flow(...)`, its internal stages are *inlined* into the outer pipeline graph — they keep their own queues, workers, and scaling. The same sub-flow definition behaves identically whether run standalone (`await heavy_path.run(producer)`) or composed. See [Composing flows](#composing-flows).
 
 ### Sink (implicit — last stage)
 
@@ -229,7 +165,7 @@ Same `flow(normalize, enrich)` definition; sink behavior is determined by contex
 
 Knowing how the framework actually calls your code helps you reason about resources, lifecycle, and side effects.
 
-In the pseudocode below, `my_queue` is the stage's own input queue and `next_queue` is the input queue of the downstream stage (or the producer's destination if this stage is upstream of the producer's first transformer).
+In the pseudocode below, `my_queue` is the stage's own input queue and `next_queue` is the input queue of the downstream stage.
 
 #### Plain async function — `async def fn(x) -> y`
 
@@ -270,37 +206,64 @@ flow(with_db(), db_write)            # ✗ pass a built CM (only enterable once)
 
 Both `@asynccontextmanager`-decorated functions and classes implementing `__aenter__`/`__aexit__` (with a no-arg constructor) satisfy the factory shape.
 
-#### Sub-flow — `Flow`
+#### Sub-flow — `Flow` (graph fragment, not a call)
 
-The worker treats the sub-flow as a nested pipeline. The sub-flow has its own internal queues and workers, isolated from the parent. Each item entering the sub-flow goes through its full chain before the result is forwarded to the parent's next queue:
+Sub-flows are **not invoked** by a parent worker. When you place a `Flow` in another `flow(...)`, the framework expands it into the parent's pipeline graph at construction time. Each sub-stage keeps its own queue and worker pool.
 
+For example:
 ```python
-# Worker loop (simplified):
-while running:
-    item = await my_queue.get()
-    result = await sub_flow.process(item)   # runs the sub-flow's chain
-    await next_queue.put(result)
+inner = flow(decode, validate)
+inner.configure("decode", scaling=UtilizationScaling(min_workers=1, max_workers=8))
+
+outer = flow(parse, inner, sink)
 ```
 
-Sub-flows are introspectable for `dump()` — the parent flow knows it contains a sub-flow and can show the nested structure.
+The effective graph that runs is:
 
-#### Router — `Router`
+```
+parse → [queue] → inner.decode → [queue] → inner.validate → [queue] → sink
+```
 
-The worker calls the classifier, looks up the matching arm, and invokes it. The arm itself is a Transformer of any shape — so router dispatching can recurse into sub-flows, CM factories, plain functions, even nested routers:
+Four stages, three queues. `inner.decode` has its own 1–8 worker pool exactly as `inner.configure` specified. The `parse` worker pushes its output into `inner.decode`'s input queue and moves on — no awaiting a result. Items flow through `inner` autonomously and arrive at `sink`'s input queue.
+
+**Sub-flow stages are namespaced** in the parent: `inner.decode`, `inner.validate`. You can override config from the parent:
+```python
+outer.configure("inner.decode", scaling=FixedScaling(workers=4))
+```
+
+The same `inner` definition runs identically standalone (`await inner.run(producer)`) or composed inside `outer`. Composition does not change behavior.
+
+#### Router — `Router` (graph fragment with branching)
+
+Like sub-flows, routers are graph fragments — each arm becomes its own sub-graph in the parent pipeline. The router has one input queue (the classifier reads from it), and dispatches items to whichever arm's input queue matches the classification.
 
 ```python
-# Worker loop (simplified):
+heavy_path = flow(decode, heavy)
+splitter = router(classify, fast=quick, slow=heavy_path)
+
+main = flow(parse, splitter, sink)
+```
+
+Effective graph:
+```
+                              ┌─ quick ──────────────────────────┐
+parse → [q] → splitter ─►─ ──┤                                  ├──► [q] → sink
+                              └─ heavy_path.decode → heavy_path.heavy ─┘
+```
+
+Each arm has its own queue and worker pool. Outputs of all arms feed the same downstream queue (the stage after the router). Sub-flow arms are inlined the same way as sub-flow stages elsewhere.
+
+The router stage itself runs the classifier:
+```python
+# Router worker loop (simplified):
 while running:
     item = await my_queue.get()
     label = await router.classifier(item)
-    arm = router.arms.get(label, router.default)
-    if arm is None:
+    target_queue = router.arm_queues.get(label, router.default_queue)
+    if target_queue is None:
         raise ValueError(f"unknown arm {label!r}")
-    result = await invoke(arm, item)        # dispatch to the right shape
-    await next_queue.put(result)
+    await target_queue.put(item)
 ```
-
-Routers are flat — whichever arm runs, its result is what the router emits. No separate "branch then merge" — the router writes directly into the next queue.
 
 ### Worker lifecycle and scaling
 
@@ -345,7 +308,7 @@ Decides how many workers a stage runs based on live `StageStats`. Built-in: `Fix
 
 ## Designing a flow
 
-A flow is **pure structure** — the chain of transformers. The producer is supplied at run time. Configuration (scaling, queues) is separate.
+A flow is **pure structure** — the chain of stages. How items get fed in is decided at activation time (`run()` or `push()`). Configuration (scaling, queues) is separate from both structure and activation.
 
 ### Linear
 
@@ -392,16 +355,32 @@ If the classifier returns a label that has no arm and no `default` is set, `Valu
 
 ### Composing flows
 
-A flow can be used as a transformer in another flow. The producer is passed only to the outermost `run()`:
+A flow can be embedded as a stage in another flow. The framework **expands the sub-flow's stages into the parent's pipeline graph** at construction. Each sub-stage retains its own queue, worker pool, scaling, and config. Activation (`run`, `send`) only happens on the outermost flow.
 
 ```python
 ingest = flow(parse, validate)
+ingest.configure("validate", scaling=UtilizationScaling(max_workers=8))
 
 main = flow(
-    ingest,             # plug in as a stage
+    ingest,             # graph-inlined into main
     db_write,
 )
 await main.run(event_source)
+
+# Effective graph at runtime:
+#   item source → ingest.parse → ingest.validate → db_write
+#
+# ingest.validate keeps its 1–8 worker scaling.
+```
+
+The same `ingest` definition runs identically standalone:
+```python
+await ingest.run(event_source)   # produces output via its last stage (validate)
+```
+
+Override sub-flow config from the parent if needed:
+```python
+main.configure("ingest.parse", scaling=FixedScaling(workers=2))
 ```
 
 ### Naming
@@ -449,7 +428,7 @@ chain.set_error_handler(on_error)
 await chain.run(reader)
 ```
 
-The same chain definition can be configured differently per environment, and driven by different producers:
+The same chain definition can be configured differently per environment, and activated against different sources:
 
 ```python
 def build():
@@ -501,8 +480,8 @@ class MyStrategy:
 Return positive to add workers, negative to remove, `0` for no change.
 
 ### Worker rules
-- **Producer** always runs exactly one worker (cannot scale; passed to `run()`)
-- **Transformers and the last stage** can scale, including down to zero
+- **The source iterator** (when you pass a producer to `run()`) is consumed by exactly one task — async generators cannot be safely consumed concurrently
+- **All stages in the chain** can scale, including down to zero
 - A worker holds its async context manager for its lifetime; releasing happens on shutdown
 - First item after `0→1` transition pays the resource-acquire cost
 
@@ -530,25 +509,60 @@ The error sink is terminal — it does not return items back into the pipeline.
 
 ## Driving a flow
 
-A `Flow` is symmetric — only how you drive it differs. Three modes, all on the same instance.
+The flow definition (`flow(...)`) describes the **chain of stages**. To make items actually flow through it, you have to **activate** the flow. There are three ways:
 
-### Bounded autonomous (`run(producer)`)
+| Mode | What feeds items into the chain | Termination |
+|---|---|---|
+| **Bounded** — `await chain.run(source)` | An async generator you supply | Generator exhausts → drain → exit |
+| **Unbounded** — `await chain.run()` | The framework emits `None` signals indefinitely | External `chain.stop()` or first stage raises |
+| **Push** — `async with chain.push() as handle: await handle.send(item)` | You push items via a `PushHandle` | `handle.complete()` (explicit or via `async with` exit) |
 
-You provide an async generator. The framework iterates it, terminates when it's exhausted.
+`Flow` exposes only the activation methods (`run`, `push`). Push mode returns a separate `PushHandle` type — `send()` and `complete()` live there, not on `Flow`. This is type-level separation: there is no way to call `send()` on a flow that hasn't been activated in push mode.
+
+`stop()` is always available on `Flow` for graceful shutdown.
+
+### Bounded — `run(source)`
+
+You pass an async generator (call it the **producer** or **source**). The framework iterates it, pushing each yielded item into the chain's first queue. When the generator is exhausted, the pipeline drains and exits.
 
 ```python
-async def reader():
+async def items():
     for i in range(100):
         yield i
 
 chain = flow(normalize, db_write)
-await chain.run(reader)
-# → reader exhausts → pipeline drains → returns
+await chain.run(items)
 ```
 
-### Unbounded autonomous (`run()`)
+#### Why one source-iterator?
 
-No producer. The framework emits `None` signals indefinitely until you call `stop()`. The first transformer is responsible for fetching the actual data:
+The framework consumes the source generator with **exactly one task** — never more. Async generators hold internal iteration state (where in the loop, last value yielded), and they cannot be safely consumed by multiple tasks:
+
+- **Two tasks calling the generator function** → each gets its own independent generator → both yield the *same* sequence → duplicates downstream.
+- **Two tasks sharing one generator instance** → race conditions on the iteration state → undefined behavior, lost or repeated items.
+
+So if you want to ingest from multiple producers in parallel, see [parallel ingestion](#parallel-ingestion) below — don't try to scale the source.
+
+#### Source can be a CM factory
+
+If your source needs setup/teardown (open a Kafka connection, then stream from it), pass a no-arg factory returning an `AsyncContextManager` whose `__aenter__` yields an async generator:
+
+```python
+@asynccontextmanager
+async def kafka_source():
+    consumer = await connect_kafka()
+    async def gen():
+        async for msg in consumer:
+            yield msg
+    yield gen()
+    await consumer.close()
+
+await chain.run(kafka_source)
+```
+
+### Unbounded — `run()` (no source)
+
+When you don't pass a source, the framework auto-emits `None` signals into the first stage's queue indefinitely. Useful for "just keep working" pipelines where the first stage knows how to fetch its own data.
 
 ```python
 async def fetch(_):
@@ -556,44 +570,71 @@ async def fetch(_):
 
 chain = flow(fetch, normalize, db_write)
 asyncio.create_task(chain.run())
-# ... later
+# ... later, when you want to stop
 await chain.stop()
 ```
 
-### Push (`async with` + `send`)
+### Push — `chain.push()` + `send()`
 
-You drive the flow by calling `send(item)`. Useful for embedding flowrhythm into a web server, WebSocket handler, or any event-driven context.
+You drive the flow yourself by pushing items via a `PushHandle`. Useful for embedding flowrhythm into a web server, WebSocket handler, or any event-driven context where items arrive from outside the flow's control.
 
 ```python
 chain = flow(normalize, db_write)
 
-async with chain:
-    await chain.send(item1)
-    await chain.send(item2)
-# on exit: framework completes the flow and waits for it to drain
+async with chain.push() as handle:
+    await handle.send(item1)
+    await handle.send(item2)
+# on exit: handle.complete() is called automatically; chain drains; workers shut down
 ```
 
-`send()` blocks if the downstream queue is full (natural backpressure).
+`handle.send()` blocks if the downstream queue is full — natural backpressure.
 
-### Mode rules
+If you need to signal end-of-stream before the `async with` exits (e.g., the producing loop ended but you still want to do work after), call `await handle.complete()` explicitly. Subsequent `send()` calls will raise.
 
-The first call **locks the mode** for that flow instance:
-- `run()` raises if the flow is already inside `async with` (push mode)
-- `send()` raises if the flow is being driven by `run()`
-- `stop()` is always available
+#### Why a separate `PushHandle`?
+
+`send()` only makes sense when push mode is active. Putting it on `Flow` would let users call it without first entering `chain.push()`, leading to runtime errors. Returning a separate `PushHandle` from `chain.push()` makes the type system enforce the rule — `Flow` has no `send()` method at all, so the mistake is impossible.
+
+### Parallel ingestion
+
+If your bottleneck is fetching from an external source (Kafka with high throughput, paginated API with many pages, SQS poller), don't try to parallelize the source itself. Instead, put the parallelism in a **fetcher transformer** — the first stage of the chain — which can be scaled freely.
+
+**Option 1: tiny trigger source + fetcher transformer**
+```python
+async def trigger():
+    while True:
+        yield None              # one signal per fetch attempt
+
+async def fetch_message(_):
+    return await kafka.poll()   # external state; safe to call from N workers
+
+chain = flow(fetch_message, normalize, db_write)
+chain.configure("fetch_message", scaling=UtilizationScaling(min_workers=4, max_workers=32))
+await chain.run(trigger)
+```
+
+**Option 2: omit the source; framework auto-emits `None`**
+```python
+chain = flow(fetch_message, normalize, db_write)
+chain.configure("fetch_message", scaling=UtilizationScaling(min_workers=4, max_workers=32))
+await chain.run()              # no source arg → framework emits None forever
+```
+
+Same outcome, less boilerplate. The fetcher stage scales to as many workers as you need; each calls the external source independently.
 
 ### Manual control
 
-For finer-grained control you can use the lower-level lifecycle methods directly:
+For finer-grained control, you can use the lifecycle methods on `Flow` directly. These are what `run()` and `push()` build on:
 
 ```python
 chain = flow(normalize, db_write)
 await chain.start()           # spawn workers, return immediately
-# ... drive items somehow (run/send/external)
-await chain.complete()        # signal "no more items"
+# ... feed items into the first stage's queue however you want
 await chain.join()            # wait until all items drain
 await chain.stop()            # abort: cancel workers, no draining
 ```
+
+In push mode, `complete()` lives on `PushHandle` (not `Flow`) — it tells the handle there are no more items so the chain can drain.
 
 ---
 
@@ -603,21 +644,30 @@ await chain.stop()            # abort: cancel workers, no draining
 
 | Symbol | Kind | Purpose |
 |---|---|---|
-| `flow(*stages)` | function | Construct a flow from a sequence of transformers (no producer) |
+| `flow(*stages)` | function | Construct a flow from a sequence of stages |
 | `router(classifier, **arms, default=...)` | function | Construct a router for branching |
 | `stage(fn, name=...)` | function | Override the auto-derived name of a stage |
 | `sync_stage(fn)` *(planned)* | function | Wrap a sync function with `asyncio.to_thread` so it can be used as an async stage |
 
-### Driving a flow (Flow methods)
+### Activating a flow
+
+| Method on `Flow` | Purpose |
+|---|---|
+| `flow.run(source=None)` | Run autonomously. With an async-generator source: bounded; without: unbounded auto-trigger |
+| `flow.push()` | Enter push mode — returns an `AsyncContextManager[PushHandle]` |
+| `flow.start()` | Low-level: spawn workers, return immediately (used internally by `run`/`push`) |
+| `flow.join()` | Low-level: wait until all items drain |
+| `flow.stop()` | Abort: cancel workers without draining |
+
+| Method on `PushHandle` (returned by `flow.push()`) | Purpose |
+|---|---|
+| `handle.send(item)` | Push an item into the flow's first queue (blocks if queue is full) |
+| `handle.complete()` | Signal end-of-stream (called automatically on `async with` exit) |
+
+### Configuration and inspection (Flow methods)
 
 | Method | Purpose |
 |---|---|
-| `flow.run(producer=None)` | Run autonomously. With a producer: bounded; without: unbounded auto-trigger |
-| `flow.send(item)` | Push an item into the flow (only valid inside `async with`) |
-| `flow.complete()` | Signal end-of-stream in push mode (called automatically on `async with` exit) |
-| `flow.start()` | Low-level: spawn workers, return immediately |
-| `flow.join()` | Low-level: wait until all items drain |
-| `flow.stop()` | Abort: cancel workers without draining |
 | `flow.configure(name, scaling=..., queue=...)` | Per-stage tuning |
 | `flow.configure_default(scaling=..., queue=...)` | Pipeline-wide defaults |
 | `flow.set_error_handler(handler)` | Set the error sink for uncaught transformer exceptions |
@@ -629,6 +679,7 @@ await chain.stop()            # abort: cancel workers, no draining
 |---|---|---|
 | `Flow` | class | Type hint only — `def helper(f: Flow) -> Flow`. Construct via `flow()`. |
 | `Router` | class | Type hint only — produced by `router()` |
+| `PushHandle` | class | Type hint only — returned by `flow.push()`; provides `send()` and `complete()` |
 | `FixedScaling`, `UtilizationScaling` | classes | Built-in scaling strategies |
 | `ScalingStrategy`, `StageStats` | protocol / dataclass | For implementing custom strategies |
 | `fifo_queue`, `lifo_queue`, `priority_queue` | functions | Queue factories |
@@ -671,14 +722,18 @@ classDiagram
     }
 
     class Flow {
-        +run(producer)
-        +send(item)
-        +complete()
+        +run(source)
+        +push() AsyncContextManager~PushHandle~
         +configure(name, scaling, queue)
         +configure_default(scaling, queue)
         +set_error_handler(handler)
         +dump(mode)
         +start() / join() / stop()
+    }
+
+    class PushHandle {
+        +send(item)
+        +complete()
     }
 
     class Router {
@@ -707,31 +762,37 @@ classDiagram
 
     flow ..> Flow : returns
     router ..> Router : returns
-    Flow ..|> Transformer : satisfies
-    Router ..|> Transformer : satisfies
-    Flow o-- Flow : composable
-    Flow o-- Router : composable
+    Flow ..> PushHandle : push() yields
+    Flow *-- Flow : inlined as sub-graph
+    Flow *-- Router : inlined as sub-graph
+    Router *-- Transformer : arms (call-shape)
     Flow --> ScalingStrategy
     ScalingStrategy <|.. FixedScaling
     ScalingStrategy <|.. UtilizationScaling
     ScalingStrategy <.. StageStats
 ```
 
-### Transformer kinds
+### How `flow()` processes each kind at construction
 
-The framework discriminates four concrete forms when running a stage:
+`flow()` walks its arguments at construction. Some kinds become **graph fragments** (expanded into the parent's pipeline graph); others are **call-shape transformers** that occupy a single graph stage.
 
 ```python
 match stage:
     case Flow() as sub_flow:
-        # introspect for dump(); run as nested pipeline
+        # GRAPH FRAGMENT: expand sub_flow's stages into the parent's graph,
+        # namespaced as "<sub_flow_name>.<inner_stage>". Sub-flow's per-stage
+        # configuration is preserved unless overridden by the parent.
     case Router() as r:
-        # dispatch to arms by classifier
-    case ctx if isinstance(ctx, AsyncContextManager):
-        # acquire on worker start, release on worker stop
-    case fn:
-        # plain async callable
+        # GRAPH FRAGMENT: each arm becomes a sub-graph. Router's classifier
+        # runs as a single stage that dispatches to arm queues.
+    case ctx if callable(ctx) and len(inspect.signature(ctx).parameters) == 0:
+        # CALL-SHAPE: CM factory; framework calls factory() per worker,
+        # enters the context, uses yielded callable per item.
+    case fn if callable(fn) and len(inspect.signature(fn).parameters) == 1:
+        # CALL-SHAPE: plain async function; called per item.
 ```
+
+After expansion, every stage in the runtime graph is a single call-shape transformer (plain async fn, CM factory, or router classifier). Each stage owns one input queue, a worker pool, and a scaling strategy.
 
 ### Pipeline Flow
 
@@ -751,9 +812,9 @@ flowchart TD
 ```
 
 Item source is one of:
-- A producer passed to `run(producer)` — bounded
+- A source generator passed to `run(source)` — bounded
 - Auto-emitted `None` signals from `run()` — unbounded
-- Items pushed via `send()` inside `async with` — push mode
+- Items pushed via `handle.send()` after `async with chain.push() as handle` — push mode
 
 ---
 

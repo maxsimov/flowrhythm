@@ -15,21 +15,19 @@ Tracks design decisions, open questions, and implementation work for flowrhythm.
 - Stage names auto-derived from function names; collisions get numeric suffix; override via `stage(fn, name=...)`
 
 ### Drive modes
-A `Flow` is symmetric — only how you drive it differs. Three modes, all on the same `Flow` instance:
+A `Flow` is symmetric — only how you activate it differs. Three modes, all on the same `Flow` instance:
 
-| Mode | API | Producer | Termination |
+| Mode | API | Item source | Termination |
 |---|---|---|---|
-| **Bounded autonomous** | `await chain.run(producer)` | Caller passes async generator (or CM factory yielding one) | Producer exhausts → drain → exit |
+| **Bounded autonomous** | `await chain.run(source)` | Caller passes async generator (or CM factory yielding one) | Source exhausts → drain → exit |
 | **Unbounded autonomous** | `await chain.run()` | Framework auto-emits `None` signals indefinitely | External `chain.stop()` or first stage raises |
-| **Push** | `async with chain: await chain.send(item)` | Caller is the producer | `complete()` (explicit or via `async with` exit) |
+| **Push** | `async with chain.push() as handle: await handle.send(item)` | Caller pushes via the handle | `handle.complete()` (explicit or via `async with` exit) |
 
-The mode is **selected by the call**:
-- Calling `run()` locks the flow into autonomous mode
-- Entering `async with chain` locks it into push mode
-- Calling `send()` outside `async with` raises
-- Calling `run()` while inside `async with` raises
+`Flow` exposes **activation modes** (`run`, `push`) but does not expose `send`/`complete` directly. Push mode returns a separate `PushHandle` type via `chain.push()`; `send()` and `complete()` live on `PushHandle`.
 
-`stop()` is always available for graceful shutdown regardless of mode.
+This is type-level separation — there is no way to call `send()` on a `Flow`. No runtime mode-locking is needed.
+
+`stop()` is always available on `Flow` for graceful shutdown regardless of mode.
 
 ### Routing
 - `router(classifier, **arms, default=...)` — branching as a regular transformer
@@ -76,13 +74,26 @@ Per-worker state without resource lifecycle: yield a closure capturing local sta
 
 **Producer as CM** is also supported — single producer means single CM entered once. Same factory shape, but the inner yielded value is an async generator (or async fetcher).
 
+### Composition (sub-flows)
+Composing a `Flow` into another `flow()` is **graph-level inlining**, not a function call. The sub-flow's stages are stitched into the parent's pipeline graph; each retains its own queue, worker pool, scaling strategy, and configuration. No correlation, no per-item return value — items flow queue-to-queue.
+
+Naming under composition:
+- Sub-flow stages are namespaced with the sub-flow's stage name in the parent: `inner.decode`, `inner.validate`
+- Parent can override: `outer.configure("inner.decode", scaling=...)`
+- Sub-flow's pre-existing config stays in effect unless overridden
+- Recursion works: a sub-flow can contain sub-flows; names compose dotted (`outer.inner.deeper`)
+
+The same `Flow` definition works **standalone** (`await inner.run(producer)`) or **composed** (`flow(parent_stage, inner, sink)`) — its behavior is identical in both cases. There is no "transformer mode" vs "standalone mode."
+
+`Flow` is therefore **not a Transformer** in the call-shape sense. It is a graph fragment that the framework expands during construction. The Transformer call-shape protocol applies only to plain async functions, CM factories, and `Router`.
+
 ### Stage role detection
 At construction, `flow()` validates each stage. Async generators are rejected — they belong to `run()` as the producer, not in the chain.
 
 ```python
 if inspect.isasyncgenfunction(stage):
     raise TypeError("flow() does not accept async generators; pass producers to run() instead")
-elif isinstance(stage, Flow):           shape = subflow
+elif isinstance(stage, Flow):           shape = subflow   # graph-inlined, not called
 elif isinstance(stage, Router):         shape = router
 elif callable(stage):
     n = len(inspect.signature(stage).parameters)
