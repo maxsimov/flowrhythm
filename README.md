@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/github/license/maxsimov/flowrhythm)](LICENSE)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/downloads/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Lines of code](https://tokei.rs/b1/github/maxsimov/flowrhythm?category=code)](https://github.com/maxsimov/flowrhythm)
 
 **Asynchronous, auto-scaling job pipeline for Python**
 
