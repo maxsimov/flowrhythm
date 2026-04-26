@@ -41,6 +41,32 @@ Pipeline DSL for chaining async stages (producer → transformers → sink) with
 - Update it when: a design decision is made, an open question is resolved, work moves between backlog/done, or new work is identified
 - Move completed items to the "Done" section rather than deleting
 
+## TODO plans
+
+- `todos/` holds individual TODO plan files; `todos/INDEX.md` is the index, listed in **priority order (top is highest)**
+- Each plan is a markdown file with a status header (`planned` | `in-progress` | `implemented`) and a checklist of items
+
+### When to read
+
+- **Before starting any non-trivial task**, scan `todos/INDEX.md` to see if an existing plan covers it. If so, work from that plan.
+- When the user asks "what's left?" or "what should we work on next?", consult the index — top-of-list is highest priority.
+
+### When to create
+
+- When the user proposes substantial new work (multiple steps, multiple files, design decisions to make), create a new plan file before starting. Add it to the index in the right priority slot.
+- Skip a plan for trivial one-shots (one file change, no design discussion) — those don't need plans.
+
+### When to update
+
+- When starting a plan: flip status to `in-progress` in both the file and the index.
+- When checking off an item: add a brief note about how/where it was done — the file becomes a record, not just a checklist.
+- When all items are done: flip status to `implemented` in both the file and the index.
+- When priority changes (something becomes more or less important): reorder rows in the index.
+
+### Never delete
+
+- Implemented plans stay as a record of what was decided and shipped. Never delete a plan file.
+
 ## Conventions
 
 ### Typing & interfaces
