@@ -127,6 +127,11 @@ Don't apply this to obvious choices (using `set()` for unique items, naming a va
 - **Coordinating concurrent tasks**: don't use `asyncio.sleep(N)` to "let other workers pick up items." Use a barrier — `asyncio.Event` set when the desired condition is reached, with workers awaiting it. Zero wall-clock time, deterministic.
 - **`asyncio.timeout(N)` IS valid as a safety net** (e.g., `async with asyncio.timeout(2): await chain.run(items)`) to prevent a buggy test from hanging the suite. This is a different use case from `wait_for(timeout)` to prove non-completion — here the timeout should never fire on a correct implementation; it's a "fail fast on hang" guard, not a measurement.
 
+#### Async error handling
+- **Catch `Exception`, never `BaseException`** in `try/except` blocks that wrap user code or async work. `asyncio.CancelledError` extends `BaseException` (not `Exception`) precisely so `except Exception` doesn't swallow it. Catching `BaseException` breaks `task.cancel()`, `Flow.stop()`, and any cooperative cancellation.
+- The one exception is when cancellation IS the deliberate signal at that point — e.g., a worker awaiting `queue.get()` catches `CancelledError` because cancellation there means "retire cleanly per the worker pool protocol." Document the exception explicitly when doing this.
+- `KeyboardInterrupt`, `GeneratorExit`, and `CancelledError` are all `BaseException` subclasses; all should propagate by default in async code.
+
 ### Git
 - Conventional commits (`feat:`, `fix:`, `refactor:`, etc.)
 - Logical chunks — one commit per complete idea

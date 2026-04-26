@@ -5,6 +5,12 @@ target; only a few primitives are wired up so far. See `todos/migrate-to-flow.md
 for the implementation plan.
 """
 
+from ._errors import (
+    Dropped,
+    DropReason,
+    SourceError,
+    TransformerError,
+)
 from ._flow import Flow, flow, sync_stage
 from ._queue import (
     AsyncQueueFactory,
@@ -23,10 +29,14 @@ from ._utilizationscaling import UtilizationScaling
 __all__ = [
     "AsyncQueueFactory",
     "AsyncQueueInterface",
+    "DropReason",
+    "Dropped",
     "FixedScaling",
     "Flow",
     "ScalingStrategy",
+    "SourceError",
     "StageSnapshot",
+    "TransformerError",
     "UtilizationScaling",
     "fifo_queue",
     "flow",

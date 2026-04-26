@@ -373,6 +373,7 @@ The polling check happens **before** the worker registers itself as idle, so a f
 - The polling check (`if alive[i] > target[i]: alive[i] -= 1; return`) has no `await` between read and write — no interleaving possible.
 - The `set.add()` → `await get()` window has no `await` — cancellation can't fire in the gap, only at the await.
 - This safety relies on the runtime functions (the polling check, the add/discard around get(), the strategy-call + counter-update window) staying synchronous. The `ScalingStrategy` Protocol declares its methods as `def`, not `async def`, specifically to preserve this invariant.
+- **Error-handling catches use `except Exception`, never `except BaseException`.** `asyncio.CancelledError` extends `BaseException` (not `Exception`) so `except Exception` doesn't swallow it — preserving cooperative cancellation. The framework wraps the user's transformer, source, and error handler in `except Exception`; cancellation propagates through to `Flow.stop()`'s shutdown cascade and worker retirement. The single intentional exception is the worker's `await queue.get()`, where `CancelledError` IS the deliberate retirement signal — that catch is `except (asyncio.QueueShutDown, asyncio.CancelledError):`.
 
 #### Strategy contract: synchronous by design
 

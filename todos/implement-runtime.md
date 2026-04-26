@@ -139,17 +139,22 @@ Deferred to later milestones:
 
 Goal: typed events to a single error handler; handler decides policy by raising vs returning.
 
-- [ ] `TransformerError(item, exception, stage)` dataclass
-- [ ] `SourceError(exception)` dataclass
-- [ ] `Dropped(item, stage, reason)` dataclass + `DropReason` enum (`UPSTREAM_TERMINATED`, `ROUTER_MISS`)
-- [ ] Wrap each transformer call in try/except; route to handler with `TransformerError`
-- [ ] Catch source generator exceptions; route to handler with `SourceError`
-- [ ] Default handler: log `TransformerError` to stderr, re-raise `SourceError`, silent on `Dropped`
-- [ ] `Flow.set_error_handler(handler)` method
-- [ ] `flow(*stages, on_error=...)` constructor kwarg
-- [ ] Handler raises → cancel workers, propagate exception out of `run()`
-- [ ] Handler returns → continue (or treat source as exhausted for `SourceError`)
-- [ ] Tests: each event type fires correctly; raise-aborts; return-continues; default behaviors match docs
+- [x] `TransformerError(item, exception, stage)` dataclass — in new `_errors.py` module
+- [x] `SourceError(exception)` dataclass
+- [x] `Dropped(item, stage, reason)` dataclass + `DropReason` enum (`UPSTREAM_TERMINATED`, `ROUTER_MISS`)
+- [x] Wrap each transformer call in try/except (catches `Exception`, NOT `BaseException` — preserves cancellation); route to handler with `TransformerError`
+- [x] Catch source generator exceptions (same Exception-only rule); route to handler with `SourceError`
+- [x] `default_handler` in `_errors.py`: log `TransformerError` to stderr; re-raise `SourceError`; silent on `Dropped`
+- [x] `Flow.set_error_handler(handler)` method
+- [x] `flow(*stages, on_error=handler)` constructor kwarg
+- [x] `_FlowRun._handle_error()` wraps the handler call (catches handler exceptions); `_abort()` triggers `shutdown(immediate=True)` cascade and stores the exception
+- [x] `execute()` re-raises `_abort_exception` after `_done_event` fires
+- [x] Handler raises → workers exit via QueueShutDown → `run()` re-raises with the handler's exception
+- [x] Handler returns → worker drops the item, continues with next; source treated as exhausted on returning from SourceError
+- [x] `Dropped` event types are exported but not yet emitted by the runtime — that lands with M5 (`UPSTREAM_TERMINATED`) and M8 (`ROUTER_MISS`)
+- [x] Tests (`tests/test_flow_errors.py` — 11 tests): TransformerError/SourceError fire correctly; handler return continues, raise aborts; default handler behavior; CancelledError propagates (doesn't reach handler); constructor kwarg ≡ method; event types exported
+
+Coverage: 98% on `_flow.py`, 94% on `_errors.py`, 98% overall. 85 tests pass in 0.11s. `make lint` clean.
 
 ### M5 — `Last(value)` + `drain()` + `stop()`
 

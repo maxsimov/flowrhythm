@@ -19,10 +19,19 @@ import functools
 import inspect
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncContextManager, AsyncGenerator, Callable
+from typing import Any, AsyncContextManager, AsyncGenerator, Awaitable, Callable
 
+from flowrhythm._errors import (
+    ErrorEvent,
+    SourceError,
+    TransformerError,
+    default_handler,
+)
 from flowrhythm._queue import AsyncQueueFactory, AsyncQueueInterface, fifo_queue
 from flowrhythm._scaling import FixedScaling, ScalingStrategy, StageSnapshot
+
+# Type alias for the error handler: `async def handler(event) -> None`
+ErrorHandler = Callable[[ErrorEvent], Awaitable[None]]
 
 
 # A normalised stage factory: a no-arg callable returning an
@@ -105,6 +114,7 @@ class Flow:
         default_scaling: ScalingStrategy | None = None,
         default_queue: AsyncQueueFactory | None = None,
         default_queue_size: int | None = None,
+        on_error: ErrorHandler | None = None,
     ) -> None:
         self._stages = stages
         self._default_config: dict[str, Any] = {}
@@ -115,6 +125,7 @@ class Flow:
         if default_queue_size is not None:
             self._default_config["queue_size"] = default_queue_size
         self._stage_config: dict[str, dict[str, Any]] = {}
+        self._error_handler: ErrorHandler = on_error or default_handler
 
     @property
     def stage_names(self) -> list[str]:
@@ -156,6 +167,16 @@ class Flow:
             self._default_config["queue"] = queue
         if queue_size is not None:
             self._default_config["queue_size"] = queue_size
+
+    def set_error_handler(self, handler: ErrorHandler) -> None:
+        """Replace the error handler.
+
+        Equivalent to passing `on_error=handler` to `flow()`. The handler is
+        an `async def handler(event)` callable that receives one of the
+        typed events from `flowrhythm._errors` (TransformerError, SourceError,
+        Dropped). Return to continue; raise to abort the run.
+        """
+        self._error_handler = handler
 
     def _resolve_config(self, name: str) -> dict[str, Any]:
         """Per-stage override → pipeline default → built-in default."""
@@ -238,6 +259,13 @@ class _FlowRun:
                 )
             )
 
+        # Error handling
+        self._handler: ErrorHandler = flow._error_handler
+        # First exception captured by _abort (handler-raise or framework
+        # bug). Stored so execute() can re-raise from run() after the
+        # pipeline drains.
+        self._abort_exception: BaseException | None = None
+
         # Run-completion state
         self._source_finished = False
         self._done_event = asyncio.Event()
@@ -274,6 +302,33 @@ class _FlowRun:
         s = self._stages[stage_idx]
         s.all_workers.add(task)
         s.alive += 1
+
+    async def _handle_error(self, event: ErrorEvent) -> None:
+        """Call the user's error handler with `event`.
+
+        If the handler raises, capture the exception and trigger an abort.
+        Catches `Exception` only (NOT `BaseException`) so cooperative
+        cancellation propagates — see DESIGN.md "Asyncio safety notes".
+        """
+        try:
+            await self._handler(event)
+        except Exception as exc:
+            self._abort(exc)
+
+    def _abort(self, exc: BaseException) -> None:
+        """Initiate immediate-abort cascade with `exc` as the cause.
+
+        Captures the first exception (subsequent calls are no-ops). Calls
+        `shutdown(immediate=True)` on every queue so workers awaiting
+        `get()` unblock with `QueueShutDown` and exit. `execute()` re-raises
+        the captured exception after `_done_event` fires.
+        """
+        if self._abort_exception is not None:
+            return
+        self._abort_exception = exc
+        for s in self._stages:
+            s.queue.shutdown(immediate=True)  # type: ignore[attr-defined]
+            s.input_drained = True
 
     def _maybe_cascade(self, stage_idx: int) -> None:
         """If stage `stage_idx` is fully drained, shut down downstream and recurse.
@@ -314,10 +369,20 @@ class _FlowRun:
     async def _source_task(self) -> None:
         first = self._stages[0]
         try:
-            async for item in self._source():
-                await first.queue.put(item)
-                # Notify the first stage's strategy that an item arrived
-                self._apply_delta(0, first.strategy.on_enqueue(self._make_snapshot(0)))
+            try:
+                async for item in self._source():
+                    await first.queue.put(item)
+                    # Notify the first stage's strategy that an item arrived
+                    self._apply_delta(
+                        0, first.strategy.on_enqueue(self._make_snapshot(0))
+                    )
+            except Exception as exc:
+                # Source raised. Route to the error handler. If the handler
+                # returns, source is treated as exhausted (drain proceeds).
+                # If the handler raises, _handle_error captures and aborts.
+                # Catches Exception (not BaseException) so CancelledError
+                # propagates correctly — see DESIGN.md "Asyncio safety notes".
+                await self._handle_error(SourceError(exception=exc))
         finally:
             first.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
             first.input_drained = True
@@ -358,9 +423,21 @@ class _FlowRun:
                     )
 
                     try:
-                        result = await user_fn(item)
-                    finally:
-                        s.busy -= 1
+                        try:
+                            result = await user_fn(item)
+                        finally:
+                            s.busy -= 1
+                    except Exception as exc:
+                        # Transformer raised. Route to handler. The item is
+                        # dropped (no put downstream). Catches Exception
+                        # only so CancelledError propagates — see DESIGN.md
+                        # "Asyncio safety notes".
+                        await self._handle_error(
+                            TransformerError(
+                                item=item, exception=exc, stage=s.name
+                            )
+                        )
+                        continue
 
                     if downstream is not None:
                         try:
@@ -396,6 +473,10 @@ class _FlowRun:
         # check_done can be true immediately. Source still sets the flag.
         self._check_done()
         await self._done_event.wait()
+        # If the error handler raised (or any other framework path called
+        # _abort), surface that exception out of run().
+        if self._abort_exception is not None:
+            raise self._abort_exception
 
 
 def flow(
@@ -403,6 +484,7 @@ def flow(
     default_scaling: ScalingStrategy | None = None,
     default_queue: AsyncQueueFactory | None = None,
     default_queue_size: int | None = None,
+    on_error: ErrorHandler | None = None,
 ) -> Flow:
     """Construct a flow from a sequence of async transformer functions.
 
@@ -481,4 +563,5 @@ def flow(
         default_scaling=default_scaling,
         default_queue=default_queue,
         default_queue_size=default_queue_size,
+        on_error=on_error,
     )
