@@ -13,7 +13,7 @@ See [`DESIGN.md`](../DESIGN.md) for the design that this implements.
 
 ## Strategy
 
-**Outside-in vertical slices.** One foundational primitive (closeable queue) is built bottom-up first; everything else lands as thin end-to-end slices, each with a smoke test. After every milestone, the package is in a runnable state and tests pass — we can stop at any milestone with a working subset.
+**Outside-in vertical slices.** One small primitive milestone first (M0 — verify stdlib `asyncio.Queue.shutdown()` behaves the way we need); everything else lands as thin end-to-end slices, each with a smoke test. After every milestone, the package is in a runnable state and tests pass — we can stop at any milestone with a working subset.
 
 **Test-first per milestone.** Write the smoke test for the milestone first, watch it fail, then implement the minimum needed to pass.
 
@@ -21,15 +21,19 @@ See [`DESIGN.md`](../DESIGN.md) for the design that this implements.
 
 ## Milestones
 
-### M0 — Closeable queue (foundational primitive)
+### M0 — Verify stdlib `Queue.shutdown()` covers our needs
 
-Goal: a queue that supports `close()`. Used by every stage from M1 onward.
+Goal: confirm that **stdlib `asyncio.Queue.shutdown()` (Python 3.13+)** does what every later milestone needs. This is mostly verification — not implementation.
 
-- [ ] Closeable subclass of `asyncio.Queue` with `close()` method
-- [ ] After `close()`: `get()` returns remaining items, then raises `QueueClosed` once empty; `put()` raises immediately
-- [ ] Same treatment for `LifoQueue` and `PriorityQueue` (reuse via mixin or wrapper)
-- [ ] Update queue factories (`fifo_queue`, `lifo_queue`, `priority_queue`) to return closeable variants; `maxsize` defaults to 1
-- [ ] Tests: put/get works; close + drain works; put-after-close raises; multi-worker get-after-close-and-empty all unblock
+Key insight from research: `asyncio.Queue` got `shutdown(immediate=False)` and `shutdown(immediate=True)` in Python 3.13 — covering both graceful drain (`Flow.drain()`) and abort (`Flow.stop()`). LIFO and Priority variants inherit it. We bumped `requires-python = ">=3.13"` in `pyproject.toml`. No custom queue subclass needed.
+
+- [ ] Update existing queue factories (`fifo_queue`, `lifo_queue`, `priority_queue`) to default `maxsize=1`. They already return `asyncio.Queue` and variants, which now have `shutdown()` for free.
+- [ ] Tests covering the stdlib behavior we depend on:
+  - graceful shutdown: enqueue items, call `shutdown(immediate=False)`, verify get() returns remaining items then raises `QueueShutDown`
+  - immediate shutdown: enqueue items, call `shutdown(immediate=True)`, verify all blocked get() callers unblock with `QueueShutDown`
+  - put-after-shutdown raises
+  - multi-worker scenario: N workers awaiting get(), shutdown unblocks all of them
+  - works for LIFO and Priority too
 
 ### M1 — Minimum linear flow
 
@@ -44,7 +48,7 @@ Goal: `flow(t1, t2).run(source)` works for plain async functions, single-worker 
 - [ ] `Flow.run(source)` — reject already-instantiated generators with helpful error message
 - [ ] Internal `_start()` / `_join()` (private) — spawn workers, wait for drain
 - [ ] Per-stage worker pool with one worker (FixedScaling(1) hardcoded)
-- [ ] EOF cascade for the linear case (source ends → close stage1 input → ... → sink)
+- [ ] EOF cascade for the linear case (source ends → `shutdown(immediate=False)` on stage1 input → workers drain and exit → cascade to sink)
 - [ ] `__init__.py` exports: `flow`, `Flow`, plus the M0 queue factories
 - [ ] Smoke test: 3-stage linear flow processes 100 items end-to-end, items arrive at sink in order
 
@@ -55,12 +59,12 @@ Goal: `FixedScaling(N)` and `UtilizationScaling` actually drive the worker pool.
 - [ ] Per-stage worker pool wires up to `ScalingStrategy.on_enqueue` / `on_dequeue`
 - [ ] FixedScaling(N) → spawn N workers at startup
 - [ ] UtilizationScaling delta → spawn or stop workers accordingly
-- [ ] Multi-worker close-cascade: each worker exits naturally on `QueueClosed`; per-stage tracker watches alive count → 0 to close downstream
+- [ ] Multi-worker drain cascade: each worker exits naturally on `QueueShutDown`; per-stage tracker watches alive count → 0 to call `shutdown(immediate=False)` on downstream
 - [ ] Default queue size `maxsize=1` (per DESIGN.md)
 - [ ] `Flow.configure(name, scaling=..., queue=..., queue_size=...)` — per-stage tuning
 - [ ] `Flow.configure_default(scaling=..., queue=...)` — pipeline-wide defaults
 - [ ] `flow(*stages, default_scaling=..., default_queue=...)` — constructor kwarg shorthand
-- [ ] Tests: 4-worker stage processes items concurrently; close-cascade with N>1 finishes cleanly; UtilizationScaling adds/removes workers under load
+- [ ] Tests: 4-worker stage processes items concurrently; drain cascade with N>1 finishes cleanly; UtilizationScaling adds/removes workers under load
 
 ### M3 — CM factory transformers
 
@@ -98,8 +102,13 @@ Goal: all three termination paths work; upstream drops emit `Dropped` events.
 - [ ] `Flow.drain()` — graceful shutdown:
   - In bounded mode: call `source.aclose()` on the source generator
   - In unbounded mode: stop emitting `None`s
+  - Trigger the drain cascade via `shutdown(immediate=False)` on the first stage's input queue
   - Wait for all in-flight items to reach terminal state (sink or error handler), then return
-- [ ] `Flow.stop()` — abort: cancel all worker tasks; ensure `__aexit__` runs on each per-worker CM; return when all workers gone
+- [ ] `Flow.stop()` — abort:
+  - Call `shutdown(immediate=True)` on every stage's input queue at once — unblocks all `get()` callers immediately
+  - Cancel any worker tasks that are mid-`processing` (in user transformer code)
+  - Each worker's per-worker CM `__aexit__` runs (resources always released)
+  - Return when all workers gone
 - [ ] Tests: `Last(value)` sink sees value last; upstream items dropped; `drain()` waits for in-flight; `stop()` is immediate
 
 ### M6 — `push()` + `PushHandle`

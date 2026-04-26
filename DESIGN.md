@@ -249,35 +249,46 @@ class Dropped:
 - Unbounded queues (`maxsize=0`) are NOT a default — must be explicitly opted into per stage; comes with OOM risk if downstream stalls
 
 ### EOF / drain cascade
-End-of-stream propagates through the pipeline by **closing queues**, not by emitting sentinel items. Queues are closeable: a custom subclass of `asyncio.Queue` (and the LIFO/Priority variants) adds `close()`. After `close()`:
-- `get()` returns any remaining items first; once the queue is empty AND closed, `get()` raises `QueueClosed`
-- `put()` raises immediately
+End-of-stream propagates through the pipeline by **shutting down queues**, not by emitting sentinel items. Built directly on **stdlib `asyncio.Queue.shutdown()`** (Python 3.13+). LIFO and Priority queue variants inherit `shutdown()` from `asyncio.Queue` — no custom subclass needed.
 
-The cascade:
+After `queue.shutdown(immediate=False)`:
+- `get()` returns any remaining items first; once the queue is empty, `get()` raises `QueueShutDown`
+- `put()` raises `QueueShutDown` immediately; blocked `put()` callers are unblocked and raise
+
+After `queue.shutdown(immediate=True)`:
+- Queue is drained; all blocked `get()` callers unblock and raise `QueueShutDown`
+- Used for `Flow.stop()` (abort path)
+
+The drain cascade (graceful, `shutdown(immediate=False)`):
 1. Trigger event happens (source generator returns; `Last(value)` returned by a transformer; `chain.drain()` called)
-2. Framework calls `close()` on the affected queue (source's destination, the stage after `Last`'s output, etc.)
-3. Workers naturally drain remaining items, then their next `get()` raises and they exit
-4. Each stage's tracker watches its alive worker count; when count drops to 0, the stage's downstream queue is closed
+2. Framework calls `shutdown(immediate=False)` on the affected queue (source's destination, the stage after `Last`'s output, etc.)
+3. Workers naturally drain remaining items, then their next `get()` raises `QueueShutDown` and they exit
+4. Each stage's tracker watches its alive worker count; when count drops to 0, the stage's downstream queue is shut down
 5. Cascade continues until the last stage exits
 
-No item is dropped during a drain — everything queued at the moment of `close()` is still processed. In-flight items in workers complete normally.
+No item is dropped during a graceful drain — everything queued at the moment of `shutdown()` is still processed. In-flight items in workers complete normally.
+
+The abort cascade (`Flow.stop()`):
+- Framework calls `shutdown(immediate=True)` on every stage's queue at once
+- All workers awaiting `get()` unblock and raise; in-flight workers complete current item, then `__aexit__` runs on their CMs (resources always released)
+- Returns when no workers are alive
 
 #### Worker states (useful for `dump()` and debugging)
 At any moment, a worker is in one of three states:
 
-| State | What the worker is doing | Affected by input-queue `close()`? |
+| State | What the worker is doing | Affected by input-queue `shutdown()`? |
 |---|---|---|
-| **`waiting_input`** | Blocked on `my_queue.get()` | Yes — get returns remaining items, then raises `QueueClosed` once empty |
+| **`waiting_input`** | Blocked on `my_queue.get()` | Yes — graceful shutdown returns remaining items first, then raises `QueueShutDown` once empty; immediate shutdown raises right away |
 | **`processing`** | Awaiting the user's transformer (`await fn(item)`) | No — current item always completes |
-| **`waiting_output`** | Blocked on `next_queue.put(result)` | No — next queue isn't closed yet (this worker is still alive) |
+| **`waiting_output`** | Blocked on `next_queue.put(result)` | No — next queue isn't shut down yet (this worker is still alive) |
 
-`dump(mode="stats")` should expose per-stage counts of workers in each state, plus the queue's open/closed status, so users can diagnose stalls (e.g., "8 workers all `waiting_output`" → downstream is the bottleneck).
+`dump(mode="stats")` should expose per-stage counts of workers in each state, plus the queue's open/shut-down status, so users can diagnose stalls (e.g., "8 workers all `waiting_output`" → downstream is the bottleneck).
 
 #### Race-free against scaling
 - Workers exit independently — no per-stage worker counter for the cascade to track (the per-stage tracker only watches "alive count → 0")
-- Scaling strategy is told "input closing" so it stops scaling up (down-scaling is fine; workers exit anyway)
+- Scaling strategy is told "input shutting down" so it stops scaling up (down-scaling is fine; workers exit anyway)
 - A worker spawned mid-drain immediately hits `get()` and either picks an in-flight item or exits cleanly — no hang, no leak
-- A worker mid-`put()` to a downstream queue is unaffected; downstream queue closes only after this stage finishes
+- A worker mid-`put()` to a downstream queue is unaffected; downstream queue is shut down only after this stage finishes
 
 ### Component class diagram
 

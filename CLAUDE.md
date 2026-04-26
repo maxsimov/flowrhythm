@@ -91,7 +91,7 @@ There are three layers of documentation, each with its own audience:
 - Type annotations carry the parameter/return documentation
 
 ### Code style
-- Python >=3.12, asyncio-native, zero runtime dependencies
+- Python >=3.13, asyncio-native, zero runtime dependencies (3.13 chosen for stdlib `asyncio.Queue.shutdown()`)
 - f-strings in main code; lazy `%` formatting in logging
 - Dataclasses by default; NamedTuples only for trivial immutable values
 - `match/case` where cleaner than if/elif

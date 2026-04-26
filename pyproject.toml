@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Asynchronous job processing framework with dynamic worker scaling"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 authors = [{ name = "Andrey Maximov" }]
 keywords = ["asyncio", "pipeline", "worker pool", "scaling", "job processing"]
 classifiers = [
