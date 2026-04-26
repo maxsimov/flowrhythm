@@ -15,29 +15,75 @@ DESIGN.md "Worker pool internals".
 """
 
 import asyncio
+import functools
 import inspect
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Callable
+from typing import Any, AsyncContextManager, AsyncGenerator, Callable
 
 from flowrhythm._queue import AsyncQueueFactory, AsyncQueueInterface, fifo_queue
 from flowrhythm._scaling import FixedScaling, ScalingStrategy, StageSnapshot
+
+
+# A normalised stage factory: a no-arg callable returning an
+# AsyncContextManager whose `__aenter__` yields the per-item callable.
+TransformerFn = Callable[[Any], Any]
+StageFactory = Callable[[], AsyncContextManager[TransformerFn]]
+
+
+def _wrap_plain_as_factory(fn: TransformerFn) -> StageFactory:
+    """Wrap a plain async transformer in a CM-factory shape.
+
+    Plain functions and CM factories use one uniform code path in the worker
+    loop (`async with stage.factory() as user_fn`). Plain functions are
+    wrapped here at construction so the runtime never has to discriminate.
+    """
+
+    @asynccontextmanager
+    async def factory() -> AsyncGenerator[TransformerFn, None]:
+        yield fn
+
+    return factory
+
+
+def sync_stage(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """Wrap a sync function so it can be used as a flow stage.
+
+    The framework rejects sync transformers (would block the event loop).
+    This helper offloads each call to a thread via `asyncio.to_thread`,
+    making a sync function safe to use as an async stage.
+
+    Stage names auto-derive from `fn.__name__` (preserved via functools.wraps).
+
+        chain = flow(sync_stage(json.loads), normalize, db_write)
+    """
+
+    @functools.wraps(fn)
+    async def wrapped(item: Any) -> Any:
+        return await asyncio.to_thread(fn, item)
+
+    return wrapped
 
 
 @dataclass
 class _StageRuntime:
     """Per-stage runtime state for one `_FlowRun`.
 
-    All scattered state for stage i — the queue, scaling strategy, function,
+    All scattered state for stage i — the factory, queue, scaling strategy,
     counters, drain flag, worker task sets — lives here in one place. New
-    per-stage state added by future milestones (M3's per-worker CM context,
-    M9/M10's timestamps) lands as new fields on this dataclass rather than
-    as another parallel list on `_FlowRun`.
+    per-stage state added by future milestones (M9/M10's timestamps, etc.)
+    lands as new fields on this dataclass rather than as another parallel
+    list on `_FlowRun`.
 
     See DESIGN.md "Per-stage state organization" for the rationale.
     """
 
     name: str
-    fn: Callable[[Any], Any]
+    # Normalised CM-factory form: factory() returns an AsyncContextManager
+    # whose `__aenter__` yields the per-item callable. Plain async functions
+    # are wrapped at construction; class-based and @asynccontextmanager
+    # factories are stored as-is.
+    factory: StageFactory
     queue: AsyncQueueInterface
     strategy: ScalingStrategy
     target: int
@@ -55,7 +101,7 @@ class Flow:
 
     def __init__(
         self,
-        stages: list[tuple[str, Callable[[Any], Any]]],
+        stages: list[tuple[str, StageFactory]],
         default_scaling: ScalingStrategy | None = None,
         default_queue: AsyncQueueFactory | None = None,
         default_queue_size: int | None = None,
@@ -176,13 +222,13 @@ class _FlowRun:
         # lives in self._stages[i] — see _StageRuntime docstring and
         # DESIGN.md "Per-stage state organization".
         self._stages: list[_StageRuntime] = []
-        for name, fn in flow._stages:
+        for name, factory in flow._stages:
             cfg = flow._resolve_config(name)
             strategy = cfg["scaling"]
             self._stages.append(
                 _StageRuntime(
                     name=name,
-                    fn=fn,
+                    factory=factory,
                     queue=cfg["queue"](maxsize=cfg["queue_size"]),
                     strategy=strategy,
                     target=strategy.initial_workers(),
@@ -229,6 +275,28 @@ class _FlowRun:
         s.all_workers.add(task)
         s.alive += 1
 
+    def _maybe_cascade(self, stage_idx: int) -> None:
+        """If stage `stage_idx` is fully drained, shut down downstream and recurse.
+
+        Called from both source_task's and worker_task's `finally`. The two
+        callers can fire in either order — whichever runs last (sets the
+        last condition true) triggers the cascade. Recursion handles the
+        case where stages were already empty: e.g. all stage 0 workers died
+        before source ended; when source's finally sets input_drained, the
+        cascade rolls through stages 1..N here.
+        """
+        s = self._stages[stage_idx]
+        if not (s.alive == 0 and s.input_drained):
+            return
+        if stage_idx + 1 >= self._n:
+            return
+        downstream = self._stages[stage_idx + 1]
+        if downstream.input_drained:
+            return
+        downstream.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+        downstream.input_drained = True
+        self._maybe_cascade(stage_idx + 1)
+
     def _apply_delta(self, stage_idx: int, delta: int) -> None:
         if delta == 0:
             return
@@ -254,6 +322,7 @@ class _FlowRun:
             first.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
             first.input_drained = True
             self._source_finished = True
+            self._maybe_cascade(0)
             self._check_done()
 
     async def _worker_task(self, stage_idx: int) -> None:
@@ -261,43 +330,51 @@ class _FlowRun:
         downstream = self._stages[stage_idx + 1] if stage_idx + 1 < self._n else None
         my_task = asyncio.current_task()
         try:
-            while True:
-                # Polling retirement check (per DESIGN.md)
-                if s.alive > s.target:
-                    return
-
-                s.idle_workers.add(my_task)
-                try:
-                    item = await s.queue.get()
-                except (asyncio.QueueShutDown, asyncio.CancelledError):
-                    return
-                finally:
-                    s.idle_workers.discard(my_task)
-
-                # Dequeue happened; busy++ before the user's transformer runs
-                s.busy += 1
-                # Notify strategy: util is now higher
-                self._apply_delta(
-                    stage_idx, s.strategy.on_dequeue(self._make_snapshot(stage_idx))
-                )
-
-                try:
-                    result = await s.fn(item)
-                finally:
-                    s.busy -= 1
-
-                if downstream is not None:
-                    try:
-                        await downstream.queue.put(result)
-                    except asyncio.QueueShutDown:
+            # State 1 → 2: enter the per-worker CM. For plain transformers
+            # this is a no-op wrapper; for CM factories it acquires
+            # resources. The worker is NOT in idle_workers here, so it
+            # cannot be targeted for cancellation during __aenter__ — see
+            # DESIGN.md "Worker lifecycle states".
+            async with s.factory() as user_fn:
+                while True:
+                    # Polling retirement check (per DESIGN.md)
+                    if s.alive > s.target:
                         return
-                    # Notify downstream stage that an item arrived
+
+                    s.idle_workers.add(my_task)
+                    try:
+                        item = await s.queue.get()
+                    except (asyncio.QueueShutDown, asyncio.CancelledError):
+                        return
+                    finally:
+                        s.idle_workers.discard(my_task)
+
+                    # Dequeue happened; busy++ before the user's transformer runs
+                    s.busy += 1
+                    # Notify strategy: util is now higher
                     self._apply_delta(
-                        stage_idx + 1,
-                        downstream.strategy.on_enqueue(
-                            self._make_snapshot(stage_idx + 1)
-                        ),
+                        stage_idx,
+                        s.strategy.on_dequeue(self._make_snapshot(stage_idx)),
                     )
+
+                    try:
+                        result = await user_fn(item)
+                    finally:
+                        s.busy -= 1
+
+                    if downstream is not None:
+                        try:
+                            await downstream.queue.put(result)
+                        except asyncio.QueueShutDown:
+                            return
+                        # Notify downstream stage that an item arrived
+                        self._apply_delta(
+                            stage_idx + 1,
+                            downstream.strategy.on_enqueue(
+                                self._make_snapshot(stage_idx + 1)
+                            ),
+                        )
+            # __aexit__ runs here on normal loop exit
         finally:
             s.all_workers.discard(my_task)
             s.alive -= 1
@@ -305,9 +382,7 @@ class _FlowRun:
             # fully drained (its input was shut down upstream and we're the
             # last worker out). Voluntary retirement (target shrunk) doesn't
             # trigger cascade because the source / upstream is still running.
-            if s.alive == 0 and downstream is not None and s.input_drained:
-                downstream.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
-                downstream.input_drained = True
+            self._maybe_cascade(stage_idx)
             self._check_done()
 
     # --- Entry point -----------------------------------------------------------
@@ -351,7 +426,11 @@ def flow(
     if not stages:
         raise TypeError("flow() requires at least one stage")
 
-    validated: list[Callable[[Any], Any]] = []
+    # Validate each stage and normalise to (name, factory) tuples.
+    # Two accepted shapes:
+    #   - 1-arg async function — plain transformer; wrapped to factory shape
+    #   - 0-arg callable (function or class) — CM factory; used as-is
+    normalised: list[tuple[str, StageFactory]] = []
     for stage in stages:
         if inspect.isasyncgenfunction(stage):
             raise TypeError(
@@ -362,30 +441,40 @@ def flow(
             raise TypeError(
                 f"flow() arguments must be callable, got {type(stage).__name__}"
             )
-        if not inspect.iscoroutinefunction(stage):
-            name = getattr(stage, "__name__", repr(stage))
-            raise TypeError(
-                f"flow() requires async functions (got sync {name!r}); "
-                f"wrap with asyncio.to_thread or use sync_stage()"
-            )
+
         sig = inspect.signature(stage)
         param_count = len(sig.parameters)
-        if param_count != 1:
-            name = getattr(stage, "__name__", repr(stage))
-            raise TypeError(
-                f"transformer must take exactly 1 argument "
-                f"(got {param_count} for {name!r})"
-            )
-        validated.append(stage)
+        name = getattr(stage, "__name__", repr(stage))
 
-    # Auto-name with collision suffix
+        if param_count == 1:
+            # Plain transformer — must be async
+            if not inspect.iscoroutinefunction(stage):
+                raise TypeError(
+                    f"transformer {name!r} is sync; wrap with sync_stage() "
+                    f"to run it via asyncio.to_thread, or rewrite as async"
+                )
+            factory = _wrap_plain_as_factory(stage)
+        elif param_count == 0:
+            # CM factory — function (@asynccontextmanager) or class with
+            # __aenter__ / __aexit__ and a no-arg constructor. We can't
+            # verify the result is a CM until call time; the framework will
+            # raise then if it isn't.
+            factory = stage  # type: ignore[assignment]
+        else:
+            raise TypeError(
+                f"stage {name!r} must take 0 args (CM factory) or 1 arg "
+                f"(transformer); got {param_count}"
+            )
+
+        normalised.append((name, factory))
+
+    # Auto-name with collision suffix (uses original name from above).
     counts: dict[str, int] = {}
-    named: list[tuple[str, Callable[[Any], Any]]] = []
-    for fn in validated:
-        base = fn.__name__
-        counts[base] = counts.get(base, 0) + 1
-        name = base if counts[base] == 1 else f"{base}_{counts[base]}"
-        named.append((name, fn))
+    named: list[tuple[str, StageFactory]] = []
+    for base_name, factory in normalised:
+        counts[base_name] = counts.get(base_name, 0) + 1
+        name = base_name if counts[base_name] == 1 else f"{base_name}_{counts[base_name]}"
+        named.append((name, factory))
 
     return Flow(
         stages=named,

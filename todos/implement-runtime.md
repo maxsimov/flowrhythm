@@ -120,11 +120,20 @@ Coverage: 97% on `_flow.py`, 98% overall. 65 tests pass in 0.05s. `make lint` cl
 
 Goal: per-worker resource lifecycle. Each worker enters its own context on spawn, exits on stop.
 
-- [ ] CM factory detection (callable with 0 params returning `AsyncContextManager`)
-- [ ] Per-worker `__aenter__` on spawn; `__aexit__` on stop (including on `stop()` and on unhandled exceptions)
-- [ ] Class-based factory support (instantiate as `cls()` per worker)
-- [ ] `sync_stage(fn)` helper — wrap a sync function with `asyncio.to_thread` so it can be used as an async stage
-- [ ] Tests: per-worker resource isolation (each worker holds its own state); `__aexit__` runs on normal shutdown, on `stop()`, on exception
+- [x] CM factory detection (callable with 0 params — function or class — used as-is; framework calls factory() per worker)
+- [x] Plain async transformers (1 arg) wrapped at construction with `_wrap_plain_as_factory` so the worker loop has one uniform `async with s.factory() as user_fn:` code path
+- [x] `_StageRuntime.factory` replaces `_StageRuntime.fn` — the field carries a normalised CM-factory shape regardless of the original stage form
+- [x] `sync_stage(fn)` helper — wraps a sync function with `asyncio.to_thread`, preserves `__name__` via `functools.wraps` so auto-naming works
+- [x] Validation messages updated: 1-arg sync function points users to `sync_stage()`; arity errors mention "0 args (CM factory) or 1 arg (transformer)"
+- [x] Drain cascade fix: extracted `_maybe_cascade()` helper called from both `source_task` and `worker_task` finally blocks. Necessary because workers can die (raise) before source ends; without this the `input_drained=True` set by source's finally has no worker exit to trigger the cascade.
+- [x] Tests (`tests/test_flow_cm.py`): per-worker isolation (4 workers → 4 distinct factory invocations); class-based CM via `cls()`; `__aexit__` runs on normal drain; `__aexit__` runs on transformer exception (both `try/finally` and class-based forms); plain function regression; `sync_stage` happy path; auto-naming preserved through `sync_stage`; sync 1-arg function rejected with `sync_stage()` pointer
+- [x] `__init__.py` exports `sync_stage`
+
+Coverage: 97% on `_flow.py`, 98% overall. 74 tests pass in 0.07s. `make lint` clean.
+
+Deferred to later milestones:
+- `__aexit__` on `Flow.stop()` — M5 will exercise this path; current design ensures cancellation can only fire in state 3 (`waiting_input`), so CM init/teardown windows are protected
+- Routing transformer exceptions to a typed-events handler — M4
 
 ### M4 — Error handling
 

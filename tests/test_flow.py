@@ -105,7 +105,7 @@ async def test_flow_rejects_wrong_arity():
     async def fn(x):
         return x
 
-    with pytest.raises(TypeError, match="1 argument"):
+    with pytest.raises(TypeError, match="0 args.*or 1 arg"):
         flow(two_args, fn)
 
 

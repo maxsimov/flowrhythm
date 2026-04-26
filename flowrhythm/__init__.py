@@ -5,7 +5,7 @@ target; only a few primitives are wired up so far. See `todos/migrate-to-flow.md
 for the implementation plan.
 """
 
-from ._flow import Flow, flow
+from ._flow import Flow, flow, sync_stage
 from ._queue import (
     AsyncQueueFactory,
     AsyncQueueInterface,
@@ -32,4 +32,5 @@ __all__ = [
     "flow",
     "lifo_queue",
     "priority_queue",
+    "sync_stage",
 ]
