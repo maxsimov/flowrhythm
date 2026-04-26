@@ -1,6 +1,6 @@
 # Implement the runtime
 
-**Status:** planned
+**Status:** in-progress
 **Updated:** 2026-04-26
 
 ## Motivation
@@ -144,14 +144,14 @@ Goal: typed events to a single error handler; handler decides policy by raising 
 - [x] `Dropped(item, stage, reason)` dataclass + `DropReason` enum (`UPSTREAM_TERMINATED`, `ROUTER_MISS`)
 - [x] Wrap each transformer call in try/except (catches `Exception`, NOT `BaseException` — preserves cancellation); route to handler with `TransformerError`
 - [x] Catch source generator exceptions (same Exception-only rule); route to handler with `SourceError`
-- [x] `default_handler` in `_errors.py`: log `TransformerError` to stderr; re-raise `SourceError`; silent on `Dropped`
+- [x] `default_handler` in `_errors.py`: log `TransformerError` to stderr; log `SourceError` to stderr (pipeline drains — source is treated as exhausted); silent on `Dropped`
 - [x] `Flow.set_error_handler(handler)` method
 - [x] `flow(*stages, on_error=handler)` constructor kwarg
 - [x] `_FlowRun._handle_error()` wraps the handler call (catches handler exceptions); logs to stderr and continues — handler is observer-only per DESIGN.md "Error handler is observer-only"
 - [x] Handler returns → worker drops the failed item, continues with next; source treated as exhausted on returning from SourceError
 - [x] Handler raises → exception logged to stderr; failed item stays dropped; pipeline continues. Aborting the run is deliberately decoupled from the handler — use `Flow.stop()` (M5) for that. Documented rationale (use cases, symmetry argument, threshold-abort pattern) added to DESIGN.md.
 - [x] `Dropped` event types are exported but not yet emitted by the runtime — that lands with M5 (`UPSTREAM_TERMINATED`) and M8 (`ROUTER_MISS`)
-- [x] Tests (`tests/test_flow_errors.py` — 11 tests): TransformerError/SourceError fire correctly; handler return continues, raise aborts; default handler behavior; CancelledError propagates (doesn't reach handler); constructor kwarg ≡ method; event types exported
+- [x] Tests (`tests/test_flow_errors.py` — 11 tests): TransformerError/SourceError fire correctly; handler return continues; handler raise is logged + pipeline continues (observer-only); default handler behavior (logs + drains for SourceError); CancelledError propagates (doesn't reach handler); constructor kwarg ≡ method; event types exported
 
 Coverage: 98% on `_flow.py`, 94% on `_errors.py`, 98% overall. 85 tests pass in 0.11s. `make lint` clean.
 
