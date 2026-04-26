@@ -1,5 +1,11 @@
 # flowrhythm
 
+[![CI](https://img.shields.io/github/actions/workflow/status/maxsimov/flowrhythm/ci.yml?branch=main&label=CI)](https://github.com/maxsimov/flowrhythm/actions)
+[![codecov](https://codecov.io/github/maxsimov/flowrhythm/graph/badge.svg?token=KRRENIJ5UF)](https://codecov.io/github/maxsimov/flowrhythm)
+[![License: MIT](https://img.shields.io/github/license/maxsimov/flowrhythm)](LICENSE)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/downloads/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
 **Asynchronous, auto-scaling job pipeline for Python**
 
 `flowrhythm` is an asyncio-native framework for stream processing pipelines. Define a pipeline as a sequence of plain async functions, then tune scaling and queues per stage at runtime.
@@ -962,5 +968,3 @@ MIT License. See `LICENSE`.
 
 **Andrey Maximov**
 [GitHub](https://github.com/maxsimov)
-
-[![codecov](https://codecov.io/github/maxsimov/flowrhythm/graph/badge.svg?token=KRRENIJ5UF)](https://codecov.io/github/maxsimov/flowrhythm)

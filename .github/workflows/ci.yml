@@ -8,21 +8,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
         with:
-          python-version: "3.13"
+          enable-cache: true
 
-      - name: Install Poetry
-        run: pip install poetry
+      - name: Set up Python
+        run: uv python install 3.13
 
       - name: Install dependencies
-        run: poetry install
+        run: uv sync
 
-      - name: Run tests and coverage
-        run: poetry run pytest --cov=flowrhythm --cov-report=xml
+      - name: Lint
+        run: uv run ruff check flowrhythm tests
 
-      - name: Upload coverage to Codecov (optional)
+      - name: Run tests with coverage
+        run: uv run pytest --cov=flowrhythm --cov-report=xml
+
+      - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
           file: ./coverage.xml
