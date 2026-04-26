@@ -62,11 +62,21 @@ For any non-obvious decision made during this milestone, verify the three-tier p
 
 Skip if the milestone made no such decisions (most bug fixes, simple features).
 
-## 7. Open questions sweep
+## 7. Invariants delta
+
+Did this milestone establish a new runtime invariant or modify an existing one?
+
+- **New invariant** — add to DESIGN.md's "Invariants" section with the next free number (`I11`, `I12`, …). Each entry: short declarative title, one-paragraph statement, where it's enforced, and what user-facing guarantee it backs (if any).
+- **Modified invariant** — update the wording in place; if the change affects existing tests or `assert # I<N>` sites, update those references too.
+- **No change** — skip.
+
+Stable numbering matters more than a short list — never renumber existing invariants.
+
+## 8. Open questions sweep
 
 Scan DESIGN.md's "Open questions" section. Anything answered during this milestone? Move it from "Open questions" into the appropriate decided-design section, keeping the resolution and rationale.
 
-## 8. Commit & offer push
+## 9. Commit & offer push
 
 - Conventional commit, milestone-tagged where applicable (e.g. `feat(M5): Last + drain + stop`)
 - Logical chunks if the work spans multiple concerns — one commit per complete idea

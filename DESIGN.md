@@ -560,6 +560,67 @@ classDiagram
 
 ---
 
+## Invariants
+
+Internal facts the runtime must maintain. Each invariant is the load-bearing reason a guarantee in README's "Guarantees" section holds, or a rule the implementation relies on for safety. Tests and `assert` sites reference invariants by number (`test_I3_*`, `assert ...  # I3`).
+
+Invariants are added incrementally — when a milestone establishes or modifies one, update this section as part of milestone exit (see [`docs/milestone-exit.md`](docs/milestone-exit.md)).
+
+### I1 — `alive[i] >= 0` always
+
+Per-stage worker count is never negative. Enforced by: `_alive` is incremented only in `_spawn_worker()` and decremented only in worker `finally` blocks; spawn is only called when `target > alive`.
+
+### I2 — `alive[i] == len(all_workers[i])`
+
+Counter matches set size at every event-loop boundary. Enforced by: `_spawn_worker()` adds the new task to `all_workers[i]` and increments `_alive` in the same synchronous block; worker `finally` removes self from set and decrements `_alive` in the same synchronous block. asyncio's single-threaded model makes those pairs atomic.
+
+### I3 — `idle_workers[i] ⊆ all_workers[i]`; idle ⇔ state 3
+
+A worker is in `idle_workers[i]` iff it is currently blocked on `queues[i].get()` (state 3 — `waiting_input`). Self-registers immediately before `await get()`, self-removes in `finally`. Used by routine cancellation to find safe-to-cancel targets.
+
+### I4 — Routine cancellation targets only `idle_workers[i]`
+
+Workers in CM init (state 2), processing (state 4), waiting_output (state 5), or CM teardown (state 6) are never targeted by routine `task.cancel()` — only workers in state 3. `Flow.stop()` is the one path that cancels indiscriminately; item loss is accepted there.
+
+This is what makes interrupting CM init/teardown structurally impossible outside the abort path.
+
+### I5 — `except Exception` preserves cancellation
+
+All runtime try/except blocks that wrap user code or async work catch `Exception`, not `BaseException`. `asyncio.CancelledError` (which extends `BaseException`) propagates through, preserving cooperative cancellation (`task.cancel()`, `Flow.stop()`).
+
+The single deliberate exception is the worker's `await queues[i].get()` site, where the catch is `except (asyncio.QueueShutDown, asyncio.CancelledError)` — cancellation there IS the retirement signal.
+
+### I6 — Drain is monotonic
+
+`input_drained[i]` transitions False → True exactly once and never reverts. Once a stage's input is marked drained, the drain cascade can rely on it without re-checking.
+
+### I7 — Done-event correctness
+
+`_done_event` is set iff `_source_finished == True AND alive[i] == 0 for all stages i`. Once set, never cleared. Run completion is detected from this state, not from awaiting a fixed task list (workers come and go dynamically — see DESIGN "Run completion: state-driven, not task-driven").
+
+### I8 — Per-worker CM lifecycle
+
+Every worker that completes its CM `__aenter__` also runs `__aexit__` before exiting — under normal drain, scale-down (polling or targeted cancel), transformer exception, or `Flow.stop()`. Enforced by structuring the worker body as `async with factory() as fn: ...`, which makes `__aexit__` non-skippable.
+
+Backs README guarantee: *"Per-worker context managers always have `__aexit__` called when the worker stops."*
+
+### I9 — Item conservation
+
+Every item that enters the chain reaches a terminal state — consumed by the sink, OR delivered to the error handler as a `TransformerError` / `Dropped` event — before `run()` returns or `async with chain.push() as h:` exits.
+
+Backs README guarantee: *"Every item that enters the chain reaches a terminal state."*
+
+### I10 — `Last(value)` ordering
+
+When a transformer at stage i returns `Last(value)`:
+- All in-flight sibling-worker results in stage i enter stage i+1's queue first (siblings finish their current item naturally before the cascade fires).
+- `value` enters stage i+1's queue last — no item from stage i appears after it.
+- No item upstream of stage i reaches stage i+1; those items are dropped with `DropReason.UPSTREAM_TERMINATED`.
+
+Backs README guarantee: *"`Last(value)` is final."*
+
+---
+
 ## Open questions
 
 - **`configure()` validation** — warn if user configures a stage name that doesn't exist in the flow?
