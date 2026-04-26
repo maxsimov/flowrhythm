@@ -41,18 +41,21 @@ Key insight from research: `asyncio.Queue` got `shutdown(immediate=False)` and `
 
 Goal: `flow(t1, t2).run(source)` works for plain async functions, single-worker stages, no errors, no scaling complications.
 
-- [ ] `flow(*stages)` constructor (positional only — kwargs come in M2/M4)
-- [ ] Stage role detection for plain async functions only (defer CM factory to M3, Router to M8, sub-flow to M7)
-- [ ] Reject async generators in `flow()` args with clear `TypeError` (per DESIGN.md)
-- [ ] Reject sync functions in `flow()` args (per DESIGN.md)
-- [ ] Auto-name stages from function names; numeric suffix on collisions
-- [ ] `Flow.run(source)` — bounded mode; consume source generator with one task
-- [ ] `Flow.run(source)` — reject already-instantiated generators with helpful error message
-- [ ] Internal `_start()` / `_join()` (private) — spawn workers, wait for drain
-- [ ] Per-stage worker pool with one worker (FixedScaling(1) hardcoded)
-- [ ] EOF cascade for the linear case (source ends → `shutdown(immediate=False)` on stage1 input → workers drain and exit → cascade to sink)
-- [ ] `__init__.py` exports: `flow`, `Flow`, plus the M0 queue factories
-- [ ] Smoke test: 3-stage linear flow processes 100 items end-to-end, items arrive at sink in order
+- [x] `flow(*stages)` constructor — `flowrhythm/_flow.py`
+- [x] Stage role detection for plain async functions only (CM factory deferred to M3, Router to M8, sub-flow to M7)
+- [x] Reject async generators in `flow()` args with clear `TypeError`
+- [x] Reject sync functions in `flow()` args; non-callables; wrong arity
+- [x] Auto-name stages from function names; numeric suffix on collisions
+- [x] `Flow.run(source)` — bounded mode; consume source generator with one task
+- [x] `Flow.run(source)` — reject already-instantiated generators with helpful error
+- [x] `Flow.run(source)` — also reject async functions that aren't generators
+- [x] Internal `_start_and_join()` — single private method spawns source-task + per-stage worker tasks, awaits all
+- [x] Per-stage worker pool with one worker (no scaling strategy yet)
+- [x] EOF cascade for the linear case (source ends → `shutdown(immediate=False)` on stage[0] input → worker drains, exits → finally closes downstream → cascade to sink)
+- [x] `__init__.py` exports: `flow`, `Flow`, plus the M0 queue factories
+- [x] Smoke test: 3-stage linear flow processes 100 items end-to-end, items arrive at sink in order. Plus 13 other tests covering single-stage, two-stage, empty source, validation rules, naming.
+
+Coverage: 97% on `_flow.py`, 98% overall. 45 tests pass in 0.03s. `make lint` clean.
 
 ### M2 — Multi-worker stages and scaling
 
