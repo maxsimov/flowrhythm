@@ -1,11 +1,12 @@
-"""Flow runtime (M1 + M2a + M2b + M2c).
+"""Flow runtime (M1 + M2a + M2b + M2c + M3 + M4 + M5 + M6).
 
 A `Flow` holds a sequence of named stages plus per-stage and pipeline-wide
-configuration. `Flow.run(source)` constructs a `_FlowRun` (an internal
-per-execution object) and executes it.
+configuration. `Flow.run(source)` and `Flow.push()` construct a `_FlowRun`
+(an internal per-execution object) and execute it. `run()` consumes a source
+generator; `push()` yields a `PushHandle` that the user feeds via `send()`.
 
-CM factories, sub-flows, routers, push mode, error handling, and dump()
-all come in later milestones. See `todos/implement-runtime.md`.
+Sub-flows, routers, and dump() come in later milestones.
+See `todos/implement-runtime.md`.
 
 End-of-stream propagates via stdlib `asyncio.Queue.shutdown()` (see
 DESIGN.md "EOF / drain cascade"). Worker pool sizing is driven by the
@@ -263,6 +264,35 @@ class Flow:
         finally:
             self._current_run = None
 
+    @asynccontextmanager
+    async def push(self) -> "AsyncGenerator[PushHandle, None]":
+        """Activate the flow in push mode.
+
+            async with chain.push() as h:
+                await h.send(item)
+            # on exit: complete() is called; pipeline drains; resources released.
+
+        The yielded `PushHandle` is the only way to feed items in this mode;
+        `send()` blocks under backpressure (queue full). Calling `complete()`
+        explicitly inside the body is fine — subsequent `send()` raises.
+
+        Use `chain.stop()` from another task to abort instead of draining.
+        """
+        if self._current_run is not None:
+            raise RuntimeError("flow already has an active run")
+        run = _FlowRun(self, source=None)
+        self._current_run = run
+        exec_task = asyncio.create_task(run.execute())
+        handle = PushHandle(run)
+        try:
+            yield handle
+        finally:
+            try:
+                await handle.complete()
+                await exec_task
+            finally:
+                self._current_run = None
+
     async def drain(self) -> None:
         """Graceful shutdown of the in-progress run. No-op if no run is
         active. Returns when the run completes."""
@@ -277,17 +307,61 @@ class Flow:
             await self._current_run.stop()
 
 
+class PushHandle:
+    """Handle for pushing items into a flow activated via `Flow.push()`.
+
+    Yielded from `chain.push()`'s async context manager. `send(item)` enqueues
+    one item (blocks under backpressure when the first stage's queue is full);
+    `complete()` signals end-of-stream (idempotent). `complete()` is called
+    automatically on `async with` exit, so most code never calls it explicitly.
+
+    See README "Push — `chain.push()` + `send()`" for usage and DESIGN.md
+    "Drive modes" for the mode-symmetry rationale.
+    """
+
+    __slots__ = ("_run", "_completed")
+
+    def __init__(self, run: "_FlowRun") -> None:
+        self._run = run
+        self._completed = False
+
+    async def send(self, item: Any) -> None:
+        """Enqueue `item`. Blocks if the first stage's queue is full.
+
+        Raises RuntimeError if `complete()` has already been called.
+        Propagates `asyncio.QueueShutDown` if the run was aborted via
+        `Flow.stop()`.
+        """
+        if self._completed:
+            raise RuntimeError("cannot send() after complete()")
+        await self._run._push_item(item)
+
+    async def complete(self) -> None:
+        """Signal end-of-stream. Idempotent; subsequent `send()` raises.
+
+        The pipeline drains naturally — items already pushed continue to
+        the sink. To abort instead, call `Flow.stop()` from another task.
+        """
+        if self._completed:
+            return
+        self._completed = True
+        self._run._mark_complete()
+
+
 class _FlowRun:
     """Internal: per-run state and execution loop for a `Flow`.
 
-    One `_FlowRun` is created per call to `Flow.run()`. It owns all mutable
-    state for that execution: the list of `_StageRuntime` (per-stage state),
-    the source generator, and the run-completion event.
+    One `_FlowRun` is created per call to `Flow.run()` or `Flow.push()`. It
+    owns all mutable state for that execution: the list of `_StageRuntime`
+    (per-stage state), the source generator (None in push mode), and the
+    run-completion event.
 
     Workers and the source task are spawned as fire-and-forget asyncio tasks
     (no `gather`, no `TaskGroup`). Completion is detected from runtime state
     via `_done_event`: set when source has finished AND all per-stage
-    `alive` counters are zero.
+    `alive` counters are zero. In push mode there's no source task — the
+    `_source_finished` flag is set directly by `_mark_complete()`,
+    `drain()`, or `stop()`.
 
     See DESIGN.md "Worker pool internals" for the design (worker lifecycle
     states, two-counter pool sizing, drain cascade) and "Run completion:
@@ -297,7 +371,7 @@ class _FlowRun:
     def __init__(
         self,
         flow: Flow,
-        source: Callable[[], AsyncGenerator[Any, None]],
+        source: Callable[[], AsyncGenerator[Any, None]] | None,
     ) -> None:
         self._source = source
 
@@ -420,6 +494,29 @@ class _FlowRun:
                 downstream.strategy.on_enqueue(self._make_snapshot(stage_idx + 1)),
             )
 
+    async def _push_item(self, item: Any) -> None:
+        """Called by `PushHandle.send()`. Enqueue + notify the strategy."""
+        first = self._stages[0]
+        await first.queue.put(item)
+        self._apply_delta(0, first.strategy.on_enqueue(self._make_snapshot(0)))
+
+    def _mark_complete(self) -> None:
+        """Called by `PushHandle.complete()`. Signal "no more items will
+        come"; let the drain cascade run.
+
+        In push mode there's no source_task whose `finally` flips
+        `_source_finished`; we set it here. Idempotent if the queue is
+        already shut down.
+        """
+        try:
+            self._stages[0].queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        self._stages[0].input_drained = True
+        self._source_finished = True
+        self._maybe_cascade(0)
+        self._check_done()
+
     async def drain(self) -> None:
         """Initiate graceful drain from outside the run.
 
@@ -435,6 +532,11 @@ class _FlowRun:
         except Exception:
             pass  # already shut down
         self._stages[0].input_drained = True
+        if self._source is None:
+            # Push mode: no source_task to flip _source_finished, so done_event
+            # would never fire. Mark it here and let the cascade roll.
+            self._source_finished = True
+            self._check_done()
         await self._done_event.wait()
 
     async def stop(self) -> None:
@@ -454,6 +556,10 @@ class _FlowRun:
             s.input_drained = True
             for task in list(s.all_workers):
                 task.cancel()
+        if self._source is None:
+            # Push mode: no source_task to flip _source_finished — see drain().
+            self._source_finished = True
+            self._check_done()
         await self._done_event.wait()
 
     async def _handle_error(self, event: ErrorEvent) -> None:
@@ -652,9 +758,10 @@ class _FlowRun:
         for stage_idx, s in enumerate(self._stages):
             for _ in range(s.target):
                 self._spawn_worker(stage_idx)
-        asyncio.create_task(self._source_task())
-        # Edge case: if the chain is empty (no stages, no workers spawned),
-        # check_done can be true immediately. Source still sets the flag.
+        if self._source is not None:
+            asyncio.create_task(self._source_task())
+        # Push mode: no source task; _source_finished is set by
+        # _mark_complete() / drain() / stop() instead.
         self._check_done()
         await self._done_event.wait()
 
