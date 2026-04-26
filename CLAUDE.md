@@ -90,6 +90,18 @@ There are three layers of documentation, each with its own audience:
 - Usage examples on key entry points (Builder, Flow), not every method
 - Type annotations carry the parameter/return documentation
 
+### Documenting non-obvious internal design decisions
+
+When you make a design decision that future contributors would otherwise have to re-derive — choosing a dataclass over parallel lists, a state-driven completion mechanism over `gather`, a sync protocol over `async`, etc. — document it in **three places**, each owning a different layer:
+
+1. **DESIGN.md owns "why"** — the architectural rationale, alternatives considered, trade-offs. Add a subsection under the relevant existing section. This is the canonical home; other places point here.
+2. **Class / function docstrings own "what + pointer to why"** — describe the role of the thing in 2-4 sentences, then end with `See DESIGN.md "<section name>" for the rationale.` A reader of the code finds the link to the rationale without needing to know the doc structure.
+3. **Inline comments at decision sites own "here's where the why applies"** — one short comment at the construction site, the worker loop, the place where the pattern is enforced. Points back at DESIGN.md by section name.
+
+This three-tier pattern keeps the rationale findable from any entry point without duplicating it. If you find yourself explaining the same "why" in code review or in a PR description, that's the signal — it belongs in DESIGN.md.
+
+Don't apply this to obvious choices (using `set()` for unique items, naming a variable `count`). Only when "why" isn't visible from the code alone.
+
 ### Code style
 - Python >=3.13, asyncio-native, zero runtime dependencies (3.13 chosen for stdlib `asyncio.Queue.shutdown()`)
 - f-strings in main code; lazy `%` formatting in logging

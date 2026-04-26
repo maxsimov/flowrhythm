@@ -16,10 +16,38 @@ DESIGN.md "Worker pool internals".
 
 import asyncio
 import inspect
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable
 
-from flowrhythm._queue import AsyncQueueFactory, fifo_queue
+from flowrhythm._queue import AsyncQueueFactory, AsyncQueueInterface, fifo_queue
 from flowrhythm._scaling import FixedScaling, ScalingStrategy, StageSnapshot
+
+
+@dataclass
+class _StageRuntime:
+    """Per-stage runtime state for one `_FlowRun`.
+
+    All scattered state for stage i — the queue, scaling strategy, function,
+    counters, drain flag, worker task sets — lives here in one place. New
+    per-stage state added by future milestones (M3's per-worker CM context,
+    M9/M10's timestamps) lands as new fields on this dataclass rather than
+    as another parallel list on `_FlowRun`.
+
+    See DESIGN.md "Per-stage state organization" for the rationale.
+    """
+
+    name: str
+    fn: Callable[[Any], Any]
+    queue: AsyncQueueInterface
+    strategy: ScalingStrategy
+    target: int
+    alive: int = 0
+    busy: int = 0
+    # True once this stage's input queue has been shut down (upstream is done
+    # feeding). Distinguishes drain cascade from voluntary worker retirement.
+    input_drained: bool = False
+    all_workers: set[asyncio.Task] = field(default_factory=set)
+    idle_workers: set[asyncio.Task] = field(default_factory=set)
 
 
 class Flow:
@@ -123,11 +151,18 @@ class Flow:
 class _FlowRun:
     """Internal: per-run state and execution loop for a `Flow`.
 
-    Holds all mutable state for one invocation of `Flow.run()`. Workers and
-    the source task are spawned as fire-and-forget asyncio tasks; completion
-    is detected via `_done_event` set when source has finished AND all
-    per-stage `_alive` counters are zero. See DESIGN.md "Worker pool
-    internals".
+    One `_FlowRun` is created per call to `Flow.run()`. It owns all mutable
+    state for that execution: the list of `_StageRuntime` (per-stage state),
+    the source generator, and the run-completion event.
+
+    Workers and the source task are spawned as fire-and-forget asyncio tasks
+    (no `gather`, no `TaskGroup`). Completion is detected from runtime state
+    via `_done_event`: set when source has finished AND all per-stage
+    `alive` counters are zero.
+
+    See DESIGN.md "Worker pool internals" for the design (worker lifecycle
+    states, two-counter pool sizing, drain cascade) and "Run completion:
+    state-driven, not task-driven" for the wait-for-done mechanism.
     """
 
     def __init__(
@@ -135,43 +170,47 @@ class _FlowRun:
         flow: Flow,
         source: Callable[[], AsyncGenerator[Any, None]],
     ) -> None:
-        self._flow = flow
         self._source = source
 
-        self._n = len(flow._stages)
-        self._configs = [flow._resolve_config(name) for name, _ in flow._stages]
-        self._queues = [c["queue"](maxsize=c["queue_size"]) for c in self._configs]
-        self._strategies: list[ScalingStrategy] = [c["scaling"] for c in self._configs]
-
-        # Per-stage state — see DESIGN.md "Worker pool internals"
-        self._target = [s.initial_workers() for s in self._strategies]
-        # `_alive` starts at zero and is incremented by `_spawn_worker()`
-        # (the sole source of truth). `execute()` spawns the initial workers
-        # and brings _alive up to _target.
-        self._alive = [0] * self._n
-        self._busy = [0] * self._n
-        self._all_workers: list[set[asyncio.Task]] = [set() for _ in range(self._n)]
-        self._idle_workers: list[set[asyncio.Task]] = [set() for _ in range(self._n)]
-        # Per-stage flag: True once this stage's INPUT queue has been shut
-        # down (i.e., upstream is done feeding). Distinguishes drain
-        # completion (downstream cascade should fire) from voluntary worker
-        # retirement (downstream should NOT cascade).
-        self._input_drained = [False] * self._n
+        # Build per-stage runtime objects. All scattered state for stage i
+        # lives in self._stages[i] — see _StageRuntime docstring and
+        # DESIGN.md "Per-stage state organization".
+        self._stages: list[_StageRuntime] = []
+        for name, fn in flow._stages:
+            cfg = flow._resolve_config(name)
+            strategy = cfg["scaling"]
+            self._stages.append(
+                _StageRuntime(
+                    name=name,
+                    fn=fn,
+                    queue=cfg["queue"](maxsize=cfg["queue_size"]),
+                    strategy=strategy,
+                    target=strategy.initial_workers(),
+                    # `alive` starts at 0 and is incremented by
+                    # `_spawn_worker()` (sole source of truth). `execute()`
+                    # spawns the initial workers and brings alive up to target.
+                )
+            )
 
         # Run-completion state
         self._source_finished = False
         self._done_event = asyncio.Event()
+
+    @property
+    def _n(self) -> int:
+        return len(self._stages)
 
     # --- Snapshots, completion, and pool management ----------------------------
 
     def _make_snapshot(self, stage_idx: int) -> StageSnapshot:
         # Timestamps are placeholder zeros for now; M9/M10 will fill them in
         # when `dump(stats)` lands.
+        s = self._stages[stage_idx]
         return StageSnapshot(
-            stage_name=self._flow._stages[stage_idx][0],
-            busy_workers=self._busy[stage_idx],
-            idle_workers=self._alive[stage_idx] - self._busy[stage_idx],
-            queue_length=self._queues[stage_idx].qsize(),
+            stage_name=s.name,
+            busy_workers=s.busy,
+            idle_workers=s.alive - s.busy,
+            queue_length=s.queue.qsize(),  # type: ignore[attr-defined]
             oldest_item_enqueued_at=0.0,
             last_enqueue_at=0.0,
             last_dequeue_at=0.0,
@@ -181,19 +220,21 @@ class _FlowRun:
         )
 
     def _check_done(self) -> None:
-        if self._source_finished and all(a == 0 for a in self._alive):
+        if self._source_finished and all(s.alive == 0 for s in self._stages):
             self._done_event.set()
 
     def _spawn_worker(self, stage_idx: int) -> None:
         task = asyncio.create_task(self._worker_task(stage_idx))
-        self._all_workers[stage_idx].add(task)
-        self._alive[stage_idx] += 1
+        s = self._stages[stage_idx]
+        s.all_workers.add(task)
+        s.alive += 1
 
     def _apply_delta(self, stage_idx: int, delta: int) -> None:
         if delta == 0:
             return
-        self._target[stage_idx] = max(0, self._target[stage_idx] + delta)
-        diff = self._target[stage_idx] - self._alive[stage_idx]
+        s = self._stages[stage_idx]
+        s.target = max(0, s.target + delta)
+        diff = s.target - s.alive
         if diff > 0:
             for _ in range(diff):
                 self._spawn_worker(stage_idx)
@@ -203,83 +244,77 @@ class _FlowRun:
     # --- Tasks -----------------------------------------------------------------
 
     async def _source_task(self) -> None:
+        first = self._stages[0]
         try:
             async for item in self._source():
-                await self._queues[0].put(item)
+                await first.queue.put(item)
                 # Notify the first stage's strategy that an item arrived
-                self._apply_delta(
-                    0, self._strategies[0].on_enqueue(self._make_snapshot(0))
-                )
+                self._apply_delta(0, first.strategy.on_enqueue(self._make_snapshot(0)))
         finally:
-            self._queues[0].shutdown(immediate=False)
-            self._input_drained[0] = True
+            first.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+            first.input_drained = True
             self._source_finished = True
             self._check_done()
 
     async def _worker_task(self, stage_idx: int) -> None:
+        s = self._stages[stage_idx]
+        downstream = self._stages[stage_idx + 1] if stage_idx + 1 < self._n else None
         my_task = asyncio.current_task()
         try:
             while True:
                 # Polling retirement check (per DESIGN.md)
-                if self._alive[stage_idx] > self._target[stage_idx]:
+                if s.alive > s.target:
                     return
 
-                self._idle_workers[stage_idx].add(my_task)
+                s.idle_workers.add(my_task)
                 try:
-                    item = await self._queues[stage_idx].get()
+                    item = await s.queue.get()
                 except (asyncio.QueueShutDown, asyncio.CancelledError):
                     return
                 finally:
-                    self._idle_workers[stage_idx].discard(my_task)
+                    s.idle_workers.discard(my_task)
 
                 # Dequeue happened; busy++ before the user's transformer runs
-                self._busy[stage_idx] += 1
+                s.busy += 1
                 # Notify strategy: util is now higher
                 self._apply_delta(
-                    stage_idx,
-                    self._strategies[stage_idx].on_dequeue(
-                        self._make_snapshot(stage_idx)
-                    ),
+                    stage_idx, s.strategy.on_dequeue(self._make_snapshot(stage_idx))
                 )
 
                 try:
-                    result = await self._flow._stages[stage_idx][1](item)
+                    result = await s.fn(item)
                 finally:
-                    self._busy[stage_idx] -= 1
+                    s.busy -= 1
 
-                if stage_idx + 1 < self._n:
+                if downstream is not None:
                     try:
-                        await self._queues[stage_idx + 1].put(result)
+                        await downstream.queue.put(result)
                     except asyncio.QueueShutDown:
                         return
                     # Notify downstream stage that an item arrived
                     self._apply_delta(
                         stage_idx + 1,
-                        self._strategies[stage_idx + 1].on_enqueue(
+                        downstream.strategy.on_enqueue(
                             self._make_snapshot(stage_idx + 1)
                         ),
                     )
         finally:
-            self._all_workers[stage_idx].discard(my_task)
-            self._alive[stage_idx] -= 1
+            s.all_workers.discard(my_task)
+            s.alive -= 1
             # Drain cascade: only fire downstream shutdown when this stage is
             # fully drained (its input was shut down upstream and we're the
             # last worker out). Voluntary retirement (target shrunk) doesn't
             # trigger cascade because the source / upstream is still running.
-            if (
-                self._alive[stage_idx] == 0
-                and stage_idx + 1 < self._n
-                and self._input_drained[stage_idx]
-            ):
-                self._queues[stage_idx + 1].shutdown(immediate=False)
-                self._input_drained[stage_idx + 1] = True
+            if s.alive == 0 and downstream is not None and s.input_drained:
+                downstream.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+                downstream.input_drained = True
             self._check_done()
 
     # --- Entry point -----------------------------------------------------------
 
     async def execute(self) -> None:
-        for stage_idx in range(self._n):
-            for _ in range(self._target[stage_idx]):
+        for stage_idx, s in enumerate(self._stages):
+            for _ in range(s.target):
                 self._spawn_worker(stage_idx)
         asyncio.create_task(self._source_task())
         # Edge case: if the chain is empty (no stages, no workers spawned),

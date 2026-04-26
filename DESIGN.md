@@ -384,6 +384,17 @@ The polling check happens **before** the worker registers itself as idle, so a f
 
 If a future need genuinely requires the strategy to invoke async work, that work belongs in a separate background task that updates state the strategy can read. Don't change the protocol to `async`.
 
+#### Per-stage state organization
+
+Per-stage runtime state lives in a **`_StageRuntime` dataclass**, not as parallel lists on `_FlowRun`. One dataclass instance per stage holds: the queue, scaling strategy, function, name, target / alive / busy counters, the input-drained flag, and the `all_workers` / `idle_workers` task sets.
+
+Why a dataclass:
+- **Adding new per-stage state** (e.g. M3's per-worker CM context, M9/M10's timestamps) only touches one definition, not N parallel-list initializers and update sites scattered around the runner
+- **Worker code reads as `s.alive`, `s.queue`, `s.busy`** — locality of reference. Parallel lists fragment one stage's state across many attributes on the runner.
+- **Lifetimes are clear**: `_FlowRun.__init__` builds its own list of `_StageRuntime` from `Flow`'s resolved config. Mutated by the runner's tasks. Garbage-collected when the run completes.
+
+`_FlowRun` itself only carries run-level state (source, the per-stage list, done event, source-finished flag). Anything per-stage belongs on `_StageRuntime`.
+
 #### Run completion: state-driven, not task-driven
 
 `Flow.run()` cannot use `asyncio.gather` or `asyncio.TaskGroup` to wait for completion. Workers come and go dynamically (UtilizationScaling spawns mid-run); a fixed task list doesn't fit. Instead, completion is detected from **runtime state**:
