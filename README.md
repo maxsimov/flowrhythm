@@ -8,6 +8,22 @@
 
 ---
 
+## Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Stages](#stages) — what's inside a stage, the four transformer shapes, how each is invoked
+- [Designing a flow](#designing-a-flow) — linear, reusable chains, routing, sub-flow composition, naming
+- [Configuring a flow](#configuring-a-flow) — per-stage scaling, queues, error handler
+- [Scaling Strategies](#scaling-strategies) — `FixedScaling`, `UtilizationScaling`, custom
+- [Error Handling](#error-handling) — typed events, handler-decides-policy
+- [Driving a flow](#driving-a-flow) — `run`, `push`, `drain`, `stop`; bounded vs unbounded vs push
+- [Public API](#public-api) — full method and type reference
+- [Guarantees](#guarantees) — what the framework promises, and what it doesn't
+- [Architecture](#architecture) — design principles, component overview, pipeline flow
+
+---
+
 ## Installation
 
 ```bash
@@ -261,7 +277,10 @@ while running:
     label = await router.classifier(item)
     target_queue = router.arm_queues.get(label, router.default_queue)
     if target_queue is None:
-        raise ValueError(f"unknown arm {label!r}")
+        # No matching arm and no default → reported to the error handler
+        # as Dropped(item, stage, reason=DropReason.ROUTER_MISS); item is dropped.
+        emit_dropped(item, reason=ROUTER_MISS)
+        continue
     await target_queue.put(item)
 ```
 
@@ -289,15 +308,23 @@ router(classifier, **arms, default=None)
 - `**arms` — keyword args mapping label → Transformer (any of the shapes above)
 - `default` — optional fallback Transformer for unmatched labels
 
-If the classifier returns a label not in `arms` and `default` is `None`, `ValueError` is raised.
+If the classifier returns a label not in `arms` and `default` is `None`, the item is dropped and the error handler receives a `Dropped(..., reason=DropReason.ROUTER_MISS)` event. The pipeline continues by default; raise from the handler to abort.
 
 ### Error Handler
 
-Pipeline-level. Receives `(item, exception)` for anything uncaught in a transformer. One per flow. Terminal — does not return items into the pipeline.
+Pipeline-level. Receives **typed events** describing failures and drops. One per flow. See [Error Handling](#error-handling) for the full set of event types and behavior.
 
 ```python
-async def on_error(item, exc):
-    logger.error("dropped %s: %s", item, exc)
+from flowrhythm import TransformerError, SourceError, Dropped
+
+async def on_error(event):
+    match event:
+        case TransformerError(item, exc, stage):
+            log.error("stage %s failed on %r: %s", stage, item, exc)
+        case SourceError(exc):
+            log.critical("source failed: %s", exc); raise
+        case Dropped(item, stage, reason):
+            log.warn("dropped %r at %s: %s", item, stage, reason.name)
 ```
 
 ### Scaling Strategy
@@ -351,7 +378,7 @@ main = flow(
 await main.run(reader)
 ```
 
-If the classifier returns a label that has no arm and no `default` is set, `ValueError` is raised.
+If the classifier returns a label that has no arm and no `default` is set, the item is **dropped** and the error handler receives a `Dropped(item, stage, reason=DropReason.ROUTER_MISS)` event. The pipeline continues running. See [Error Handling](#error-handling) if you want to abort on router misses (raise from your handler).
 
 ### Composing flows
 
@@ -489,21 +516,90 @@ Return positive to add workers, negative to remove, `0` for no change.
 
 ## Error Handling
 
+Errors and drops are reported to a single pipeline-level **error handler** as **typed events**. The handler decides what to do with each event by what it does with it:
+
+- **Returns normally** → pipeline continues
+- **Raises** → pipeline aborts, exception propagates out of `run()`
+
 Two layers, in order:
 
-1. **Inside the transformer** (preferred). Catch and handle: log, retry, return a sentinel, drop.
-2. **Pipeline error sink** (last resort). Anything uncaught in a transformer is routed here.
+1. **Inside the transformer** (preferred). Catch and handle there: retry, return a sentinel value, drop silently. Most error logic should live here because the transformer has full context.
+2. **Pipeline error handler** (last resort). Whatever escapes the transformer (or comes from the source / framework decisions like `Dropped`) is routed here.
+
+### Event types
 
 ```python
-async def on_error(item, exc):
-    logger.error("dropped %s: %s", item, exc)
+from dataclasses import dataclass
+from enum import Enum
+
+@dataclass
+class TransformerError:
+    item: Any
+    exception: Exception
+    stage: str            # name of the stage that failed
+
+@dataclass
+class SourceError:
+    exception: Exception  # raised inside the source generator
+
+class DropReason(Enum):
+    UPSTREAM_TERMINATED   # Last(value) upstream caused this item to be discarded
+    ROUTER_MISS           # router classifier returned an unknown arm and no default
+
+@dataclass
+class Dropped:
+    item: Any
+    stage: str
+    reason: DropReason
+```
+
+### Writing a handler
+
+```python
+from flowrhythm import flow, TransformerError, SourceError, Dropped
+
+async def on_error(event):
+    match event:
+        case TransformerError(item, exc, stage):
+            log.error("stage %s failed on %r: %s", stage, item, exc)
+            # returning continues the pipeline
+        case SourceError(exc):
+            log.critical("source failed: %s", exc)
+            raise           # aborts the pipeline
+        case Dropped(item, stage, reason):
+            log.warn("dropped %r at %s (%s)", item, stage, reason.name)
 
 chain = flow(normalize, db_write)
 chain.set_error_handler(on_error)
-await chain.run(reader)
+await chain.run(items)
 ```
 
-The error sink is terminal — it does not return items back into the pipeline.
+### Default behavior (no handler set)
+
+| Event | Default |
+|---|---|
+| `TransformerError` | Logged to stderr, pipeline continues |
+| `SourceError` | Re-raised — fatal |
+| `Dropped` | Silent continue |
+
+Set a handler whenever you need different behavior for any of these.
+
+### Producer error policy is a handler choice
+
+The handler decides whether a source error is fatal or not. To abort, raise from the handler. To drain gracefully, log and return:
+
+```python
+# Policy: abort on source error (default behavior)
+case SourceError(exc):
+    raise
+
+# Policy: log and drain on source error
+case SourceError(exc):
+    log.error("source: %s", exc)
+    # return without raising → source treated as exhausted; chain drains normally
+```
+
+No separate config flag — write the handler that matches your policy.
 
 ---
 
@@ -622,19 +718,37 @@ await chain.run()              # no source arg → framework emits None forever
 
 Same outcome, less boilerplate. The fetcher stage scales to as many workers as you need; each calls the external source independently.
 
-### Manual control
+### Stopping a running flow
 
-For finer-grained control, you can use the lifecycle methods on `Flow` directly. These are what `run()` and `push()` build on:
+The three activation modes above are the only public ways to drive a flow. Combined with `stop()` (abort) and `drain()` (graceful), they cover every legitimate scenario.
 
 ```python
-chain = flow(normalize, db_write)
-await chain.start()           # spawn workers, return immediately
-# ... feed items into the first stage's queue however you want
-await chain.join()            # wait until all items drain
-await chain.stop()            # abort: cancel workers, no draining
+# Graceful shutdown
+task = asyncio.create_task(chain.run(source))
+# ...
+await chain.drain()       # waits for items in flight to finish
+await task                # task returns normally
+
+# Abort
+task = asyncio.create_task(chain.run(source))
+# ...
+await chain.stop()        # cancels workers, drops in-flight items
+await task
 ```
 
-In push mode, `complete()` lives on `PushHandle` (not `Flow`) — it tells the handle there are no more items so the chain can drain.
+#### What `drain()` does to your source
+
+| Mode | What the user observes |
+|---|---|
+| `run(source)` | Framework calls `source.aclose()` on your generator; if you have `try/finally` cleanup in the generator, it runs. Then in-flight items finish. |
+| `run()` (auto-trigger) | Framework stops emitting `None` signals. In-flight items finish. |
+| `chain.push()` | The next `send()` raises. In-flight items finish. (Usually you don't need to call `drain()` explicitly here — exit the `async with` instead.) |
+
+In all cases, `drain()` returns once every item that entered the chain has reached the sink or the error handler.
+
+#### Push-mode shortcuts
+
+Exiting the `async with chain.push() as h:` block automatically calls `h.complete()` and waits for the chain to drain — no explicit `drain()` needed. To abort instead of draining, call `chain.stop()` from another task.
 
 ---
 
@@ -655,9 +769,8 @@ In push mode, `complete()` lives on `PushHandle` (not `Flow`) — it tells the h
 |---|---|
 | `flow.run(source=None)` | Run autonomously. With an async-generator source: bounded; without: unbounded auto-trigger |
 | `flow.push()` | Enter push mode — returns an `AsyncContextManager[PushHandle]` |
-| `flow.start()` | Low-level: spawn workers, return immediately (used internally by `run`/`push`) |
-| `flow.join()` | Low-level: wait until all items drain |
-| `flow.stop()` | Abort: cancel workers without draining |
+| `flow.drain()` | Graceful shutdown: stop the source (or `aclose()` your generator), wait for in-flight items to finish, then return |
+| `flow.stop()` | Abort: cancel workers, drop in-flight items, release resources |
 
 | Method on `PushHandle` (returned by `flow.push()`) | Purpose |
 |---|---|
@@ -680,9 +793,48 @@ In push mode, `complete()` lives on `PushHandle` (not `Flow`) — it tells the h
 | `Flow` | class | Type hint only — `def helper(f: Flow) -> Flow`. Construct via `flow()`. |
 | `Router` | class | Type hint only — produced by `router()` |
 | `PushHandle` | class | Type hint only — returned by `flow.push()`; provides `send()` and `complete()` |
+| `Last` | class | Wrap a transformer's return value: `return Last(result)` to mark this as the final item |
+| `TransformerError`, `SourceError`, `Dropped` | dataclasses | Event types passed to the error handler |
+| `DropReason` | enum | Reasons items get dropped (`UPSTREAM_TERMINATED`, `ROUTER_MISS`) |
 | `FixedScaling`, `UtilizationScaling` | classes | Built-in scaling strategies |
 | `ScalingStrategy`, `StageStats` | protocol / dataclass | For implementing custom strategies |
 | `fifo_queue`, `lifo_queue`, `priority_queue` | functions | Queue factories |
+
+---
+
+## Guarantees
+
+Promises the framework makes to the user. If any of these are violated, it's a bug.
+
+### Item processing
+- **Every item that enters the chain reaches a terminal state** before `run()` returns or `async with chain.push()` exits. A terminal state is: consumed by the sink, *or* routed to the error handler.
+- **`Last(value)` is final.** If a transformer returns `Last(value)`, the sink will see `value` as its last item. No item can reach the sink after `value`.
+
+### Resources
+- **Per-worker context managers always have `__aexit__` called** when the worker stops, even on `stop()` (immediate abort) or unhandled exceptions.
+- **Resources are released before `run()` (or `stop()`) returns.** When the call returns, no workers are alive and no resources are held.
+
+### Termination
+- **`chain.run(source)` returns naturally** when the source generator completes and the pipeline finishes draining.
+- **`chain.run(source)` re-raises** any exception that escapes the source (subject to the error handler — see [Error Handling](#error-handling)).
+- **`chain.stop()` returns** only after every worker has exited and every per-worker resource has been released.
+- **`chain.drain()` returns** only after the pipeline is fully drained — no items in flight, all workers idle/exited.
+
+### Sources
+- **Async generators are consumed by exactly one task.** The framework never forks a generator.
+- **The same flow definition behaves identically standalone or composed.** Embedding a flow as a stage in another flow does not change its per-stage scaling, queues, or configuration.
+
+### Order
+- **Within a single-worker stage, item order is preserved.** Items leave in the same order they arrived.
+- **Across multi-worker stages, order is *not* preserved.** With N > 1 workers, items may complete in any order. If you need order, use `FixedScaling(workers=1)` for that stage.
+
+### Backpressure
+- **Slow downstream stages naturally throttle upstream.** A stage with a full input queue causes the upstream stage to block on `put()`, which propagates back to the source. There is no item buffering beyond configured queue sizes.
+
+### What is *not* guaranteed
+- **Exactly-once delivery.** If a transformer raises and the error handler routes it to a log, the item is gone — no retry, no checkpointing.
+- **Persistence across process restart.** Items in flight when the process dies are lost.
+- **Order across router arms.** If two arms have different latencies, items from the faster arm may interleave with items from the slower arm in the downstream stage.
 
 ---
 
@@ -724,11 +876,12 @@ classDiagram
     class Flow {
         +run(source)
         +push() AsyncContextManager~PushHandle~
+        +drain()
+        +stop()
         +configure(name, scaling, queue)
         +configure_default(scaling, queue)
         +set_error_handler(handler)
         +dump(mode)
-        +start() / join() / stop()
     }
 
     class PushHandle {
@@ -805,10 +958,11 @@ flowchart TD
     B -. "router()" .-> F{Classifier}
     F -- arm 1 --> G[Transformer / Chain / Flow]
     F -- arm 2 --> H[Transformer / Chain / Flow]
-    F -- unknown --> I[default or ValueError]
+    F -- unknown --> I[default arm, or Dropped → Error Handler]
     G --> D
     H --> D
     I --> D
+    I -. drop .-> E
 ```
 
 Item source is one of:

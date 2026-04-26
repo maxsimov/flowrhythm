@@ -27,6 +27,13 @@ Pipeline DSL for chaining async stages (producer → transformers → sink) with
 - **Always illustrate with concrete code examples** — shapes, signatures, and prose are not enough on their own
 - Prefer "Why? / What to do instead" subsections over single-line caveats
 
+### Describe behavior from the user's perspective
+
+- Document what the user **writes**, what they **observe**, and what the framework **guarantees** — never how it's implemented
+- Words like *queue*, *worker*, *sentinel*, *close()* are implementation details. Avoid them in user-facing docs unless the user can directly observe or configure them (e.g., they can configure a queue *type*, but they don't see queue close events)
+- When explaining a feature, write each step as either "the user does X" or "the user observes Y", not "the framework calls Z internally"
+- Implementation mechanics belong in ROADMAP or code comments, not in the README
+
 ## Roadmap
 
 - ROADMAP.md tracks decided design, open questions, and implementation backlog

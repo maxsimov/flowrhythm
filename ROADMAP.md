@@ -134,12 +134,50 @@ The **last stage** in `flow()` plays the sink role when run autonomously — its
 - Retry/iteration belongs inside a stage, not in graph topology
 
 ### Error handling
-- Two layers: handle inside transformer (preferred), pipeline error sink (last resort)
+- Two layers: handle inside transformer (preferred), pipeline error handler (last resort)
 - Built-in exceptions only — no custom hierarchy
+- Error handler receives **typed events**, not raw `(item, exception)` tuples
+- Handler behavior decides policy:
+  - Returns normally → pipeline continues
+  - Raises → pipeline aborts, exception propagates out of `run()`
+- Default behavior when no handler is set:
+  - `TransformerError` → log to stderr, continue
+  - `SourceError` → re-raise (fatal)
+  - `Dropped` → silent continue
+
+#### Event types (initial set)
+```python
+@dataclass
+class TransformerError:
+    item: Any
+    exception: Exception
+    stage: str
+
+@dataclass
+class SourceError:
+    exception: Exception
+
+@dataclass
+class Dropped:
+    item: Any
+    stage: str
+    reason: DropReason   # enum
+```
+
+`DropReason` enum:
+- `UPSTREAM_TERMINATED` — `Last(value)` upstream caused this item to be discarded
+- `ROUTER_MISS` — router classifier returned an unknown arm and there was no `default`
+
+### Termination
+- **`Last(value)`** — wrapper a transformer can return to mean "this is the absolute last item." `value` flows downstream as the final item; everything still upstream of this transformer is dropped (each dropped item generates a `Dropped` event).
+- **`chain.run(source)` returns naturally** when source generator completes — graceful drain.
+- **`chain.drain()`** — graceful from outside (only meaningful in unbounded `run()` mode where there's no source the user controls).
+- **`chain.stop()`** — immediate abort; resources released, items in flight dropped.
+- **Source generator raises** — abort by default (re-raise from `run()`); user can wrap source for retry.
 
 ### Lifecycle
-- `flow.run()` — run to completion
-- `flow.start()` / `flow.join()` / `flow.stop()` — manual control
+- Public API: `run(source)`, `run()`, `push()`, `drain()`, `stop()` only
+- `start()` / `join()` are internal — used by `run()` and `push()` but not exposed. There is no legitimate user scenario for them; every way of feeding items into a flow is covered by the public methods. Hiding them keeps the surface minimal and prevents misuse (leaked workers, undefined-state mode mixing).
 
 ### Queue type
 - Pipeline-wide default + per-stage override
