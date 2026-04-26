@@ -112,6 +112,8 @@ There are three layers of documentation, each with its own audience:
   - **Task introspection** — when you must prove "this coroutine is blocked": `task = asyncio.create_task(coro); await asyncio.sleep(0); assert not task.done(); task.cancel()`. The `sleep(0)` yields exactly one event-loop tick — long enough for tasks to reach their first await, no real time spent.
 - **`await asyncio.sleep(0)` is the canonical idiom for "let pending tasks reach their await point."** Use it (not `sleep(0.01)` or larger) when coordinating multiple tasks in a test.
 - **Time mocking** (freezegun, custom event loop) is only worth the setup cost when the *thing being tested* is time-based logic — e.g., `cooldown_seconds` or `sampling_period`. For "queue is full," "task is blocked," "shutdown unblocks waiters" — don't reach for time mocking; use the techniques above.
+- **Coordinating concurrent tasks**: don't use `asyncio.sleep(N)` to "let other workers pick up items." Use a barrier — `asyncio.Event` set when the desired condition is reached, with workers awaiting it. Zero wall-clock time, deterministic.
+- **`asyncio.timeout(N)` IS valid as a safety net** (e.g., `async with asyncio.timeout(2): await chain.run(items)`) to prevent a buggy test from hanging the suite. This is a different use case from `wait_for(timeout)` to prove non-completion — here the timeout should never fire on a correct implementation; it's a "fail fast on hang" guard, not a measurement.
 
 ### Git
 - Conventional commits (`feat:`, `fix:`, `refactor:`, etc.)

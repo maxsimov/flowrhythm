@@ -45,18 +45,29 @@ async def test_multi_worker_stage_processes_all_items():
 
 
 async def test_workers_run_concurrently():
-    """With N workers and items that yield, multiple should be in-flight at once."""
+    """4 workers must be in-flight simultaneously when items are available.
+
+    Each worker enters `slow`, increments in_flight, and waits on a barrier
+    that fires only when in_flight reaches 4. If the framework runs workers
+    sequentially (bug), this test will deadlock — wrapped in
+    `asyncio.timeout` as a safety net so it fails fast rather than hanging.
+    """
     in_flight = 0
     max_in_flight = 0
-    lock = asyncio.Lock()
+    state_lock = asyncio.Lock()
+    all_four_in_flight = asyncio.Event()
 
     async def slow(x):
         nonlocal in_flight, max_in_flight
-        async with lock:
+        async with state_lock:
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
-        await asyncio.sleep(0.01)  # let other workers grab items
-        async with lock:
+            if in_flight >= 4:
+                all_four_in_flight.set()
+        # Block until all 4 are in-flight. No real time is spent — the event
+        # fires the moment the 4th worker enters.
+        await all_four_in_flight.wait()
+        async with state_lock:
             in_flight -= 1
         return x
 
@@ -68,11 +79,11 @@ async def test_workers_run_concurrently():
             yield i
 
     chain = flow(slow, sink, _workers_per_stage=4)
-    await chain.run(items)
+    async with asyncio.timeout(2):  # safety net against deadlock; not measuring time
+        await chain.run(items)
 
-    # With 4 workers, we should see at least 2 concurrent (likely all 4).
-    # Strict >1 is the meaningful assertion: proves true concurrency, not just sequential.
-    assert max_in_flight > 1
+    # Strict equality: proves all 4 workers were truly concurrent at peak.
+    assert max_in_flight == 4
 
 
 async def test_default_remains_single_worker():
