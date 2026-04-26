@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncContextManager, AsyncGenerator, Awaitable, Callable
 
 from flowrhythm._errors import (
+    DropReason,
+    Dropped,
     ErrorEvent,
     SourceError,
     TransformerError,
@@ -33,6 +35,41 @@ from flowrhythm._scaling import FixedScaling, ScalingStrategy, StageSnapshot
 
 # Type alias for the error handler: `async def handler(event) -> None`
 ErrorHandler = Callable[[ErrorEvent], Awaitable[None]]
+
+
+class Last:
+    """Wrap a transformer's return value to mean "this is the absolute
+    last item the pipeline should produce."
+
+        async def fn(item):
+            if item.is_terminator:
+                return Last(process(item))
+            return process(item)
+
+    When a worker returns `Last(value)`:
+      1. Upstream is killed (source's queue is shut down; cascades through
+         stages 0..i).
+      2. Idle sibling workers in stage i are cancelled.
+      3. Busy sibling workers finish their current item; their results
+         flow into the downstream queue first.
+      4. Once all siblings have exited, this worker propagates `value`
+         downstream — the absolute last item to enter the next queue.
+
+    Source items that couldn't be pushed because the source's queue was
+    shut down emit `Dropped(item, "<source>", DropReason.UPSTREAM_TERMINATED)`
+    events to the error handler.
+
+    See README "Stopping from inside a transformer" and DESIGN.md
+    "Termination".
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"Last({self.value!r})"
 
 
 # A normalised stage factory: a no-arg callable returning an
@@ -104,6 +141,10 @@ class _StageRuntime:
     input_drained: bool = False
     all_workers: set[asyncio.Task] = field(default_factory=set)
     idle_workers: set[asyncio.Task] = field(default_factory=set)
+    # Set by a worker that returned `Last(value)` to signal "wake me when
+    # alive drops to 1 (only I remain) — then I'll propagate the value".
+    # Other workers' `finally` blocks set this when alive == 1.
+    last_cascade_event: asyncio.Event | None = None
 
 
 class Flow:
@@ -127,6 +168,9 @@ class Flow:
             self._default_config["queue_size"] = default_queue_size
         self._stage_config: dict[str, dict[str, Any]] = {}
         self._error_handler: ErrorHandler = on_error or default_handler
+        # Set while a run is in progress; used by drain() / stop() to
+        # reach into the active _FlowRun. None when no run is active.
+        self._current_run: "_FlowRun | None" = None
 
     @property
     def stage_names(self) -> list[str]:
@@ -213,7 +257,24 @@ class Flow:
             )
 
         runner = _FlowRun(self, source)
-        await runner.execute()
+        self._current_run = runner
+        try:
+            await runner.execute()
+        finally:
+            self._current_run = None
+
+    async def drain(self) -> None:
+        """Graceful shutdown of the in-progress run. No-op if no run is
+        active. Returns when the run completes."""
+        if self._current_run is not None:
+            await self._current_run.drain()
+
+    async def stop(self) -> None:
+        """Immediate abort of the in-progress run. No-op if no run is
+        active. In-flight items are dropped; per-worker resources are
+        released via `__aexit__`. Returns when all workers have exited."""
+        if self._current_run is not None:
+            await self._current_run.stop()
 
 
 class _FlowRun:
@@ -303,6 +364,98 @@ class _FlowRun:
         s.all_workers.add(task)
         s.alive += 1
 
+    async def _handle_last(self, stage_idx: int, last_value: Any) -> None:
+        """Initiate the Last(value) cascade.
+
+        Steps (per DESIGN.md "Termination"):
+          1. Kill upstream — shutdown queues 0..stage_idx so source and
+             upstream stages stop feeding new items. This stage's own input
+             queue is included so sibling workers blocked on `get()` see
+             QueueShutDown.
+          2. Cancel idle sibling workers (those in `idle_workers`) in
+             stage_idx. Cancelling busy workers would lose in-flight items;
+             we let them finish naturally.
+          3. Wait until all siblings have exited (this worker is the only
+             one left alive in stage_idx). Sibling exits drive `alive`
+             down; the last sibling out signals `last_cascade_event`.
+          4. Propagate `last_value` to the downstream queue. By this point,
+             all sibling results have already been put — `last_value` is
+             the absolute last item to enter queue[stage_idx + 1].
+        """
+        s = self._stages[stage_idx]
+        my_task = asyncio.current_task()
+
+        # Step 1: kill upstream (queues 0..stage_idx inclusive)
+        for i in range(stage_idx + 1):
+            try:
+                self._stages[i].queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+            except Exception:
+                pass  # already shut down
+            self._stages[i].input_drained = True
+
+        # Step 2: cancel idle siblings in this stage
+        for sibling in list(s.idle_workers):
+            if sibling is not my_task:
+                sibling.cancel()
+
+        # Step 3: wait for siblings to exit (busy ones finish their item;
+        # idle ones are now cancelled). When alive drops to 1 (just me),
+        # last_cascade_event fires from the last sibling's `finally`.
+        if s.alive > 1:
+            s.last_cascade_event = asyncio.Event()
+            try:
+                await s.last_cascade_event.wait()
+            finally:
+                s.last_cascade_event = None
+
+        # Step 4: propagate last_value as the final item entering downstream
+        if stage_idx + 1 < self._n:
+            downstream = self._stages[stage_idx + 1]
+            try:
+                await downstream.queue.put(last_value)
+            except asyncio.QueueShutDown:
+                return  # downstream already torn down (e.g., stop())
+            self._apply_delta(
+                stage_idx + 1,
+                downstream.strategy.on_enqueue(self._make_snapshot(stage_idx + 1)),
+            )
+
+    async def drain(self) -> None:
+        """Initiate graceful drain from outside the run.
+
+        Source's queue is shut down; the source's next put raises and the
+        source ends. Items in flight finish through the cascade. Returns
+        when the run completes.
+        """
+        if self._source_finished:
+            await self._done_event.wait()
+            return
+        try:
+            self._stages[0].queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+        except Exception:
+            pass  # already shut down
+        self._stages[0].input_drained = True
+        await self._done_event.wait()
+
+    async def stop(self) -> None:
+        """Initiate immediate abort.
+
+        Every queue is shut down with `immediate=True` (in-flight items in
+        queues are dropped). Every worker task is cancelled — including
+        busy ones (state 4 — `processing`); their `__aexit__` still runs
+        because cancellation occurs inside the `async with` body. Returns
+        when all workers have exited.
+        """
+        for s in self._stages:
+            try:
+                s.queue.shutdown(immediate=True)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            s.input_drained = True
+            for task in list(s.all_workers):
+                task.cancel()
+        await self._done_event.wait()
+
     async def _handle_error(self, event: ErrorEvent) -> None:
         """Call the user's error handler with `event`.
 
@@ -363,23 +516,46 @@ class _FlowRun:
 
     async def _source_task(self) -> None:
         first = self._stages[0]
+        src_gen = self._source()
         try:
             try:
-                async for item in self._source():
-                    await first.queue.put(item)
+                async for item in src_gen:
+                    try:
+                        await first.queue.put(item)
+                    except asyncio.QueueShutDown:
+                        # Framework shut down the source's queue (drain(),
+                        # stop(), or Last() cascade). The item we held is
+                        # dropped; report it as a Dropped event with the
+                        # UPSTREAM_TERMINATED reason. Then exit the loop.
+                        await self._handle_error(
+                            Dropped(
+                                item=item,
+                                stage="<source>",
+                                reason=DropReason.UPSTREAM_TERMINATED,
+                            )
+                        )
+                        break
                     # Notify the first stage's strategy that an item arrived
                     self._apply_delta(
                         0, first.strategy.on_enqueue(self._make_snapshot(0))
                     )
             except Exception as exc:
-                # Source raised. Route to the error handler. If the handler
-                # returns, source is treated as exhausted (drain proceeds).
-                # If the handler raises, _handle_error captures and aborts.
+                # Source generator itself raised. Route to the handler.
                 # Catches Exception (not BaseException) so CancelledError
                 # propagates correctly — see DESIGN.md "Asyncio safety notes".
                 await self._handle_error(SourceError(exception=exc))
         finally:
-            first.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+            # Best-effort: close the generator so any try/finally cleanup
+            # inside the user's source runs. Errors during aclose are
+            # swallowed — we're already in cleanup.
+            try:
+                await src_gen.aclose()
+            except Exception:
+                pass
+            try:
+                first.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+            except Exception:
+                pass  # already shut down (drain/stop/Last)
             first.input_drained = True
             self._source_finished = True
             self._maybe_cascade(0)
@@ -434,6 +610,14 @@ class _FlowRun:
                         )
                         continue
 
+                    if isinstance(result, Last):
+                        # Initiate the Last cascade: kill upstream, cancel
+                        # idle siblings, wait for busy siblings, then
+                        # propagate the wrapped value as the LAST item to
+                        # enter the downstream queue.
+                        await self._handle_last(stage_idx, result.value)
+                        return
+
                     if downstream is not None:
                         try:
                             await downstream.queue.put(result)
@@ -450,6 +634,11 @@ class _FlowRun:
         finally:
             s.all_workers.discard(my_task)
             s.alive -= 1
+            # If a Last() cascade is in progress in this stage, signal the
+            # waiting worker once we (a sibling) have exited, leaving only
+            # the cascade-initiator alive.
+            if s.last_cascade_event is not None and s.alive == 1:
+                s.last_cascade_event.set()
             # Drain cascade: only fire downstream shutdown when this stage is
             # fully drained (its input was shut down upstream and we're the
             # last worker out). Voluntary retirement (target shrunk) doesn't

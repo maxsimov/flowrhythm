@@ -159,20 +159,20 @@ Coverage: 98% on `_flow.py`, 94% on `_errors.py`, 98% overall. 85 tests pass in 
 
 Goal: all three termination paths work; upstream drops emit `Dropped` events.
 
-- [ ] `Last(value)` wrapper class
-- [ ] `Last` detection in worker loop: forward wrapped value, then trigger upstream drain from this stage
-- [ ] Dropped upstream items emit `Dropped(..., UPSTREAM_TERMINATED)` events
-- [ ] `Flow.drain()` — graceful shutdown:
-  - In bounded mode: call `source.aclose()` on the source generator
-  - In unbounded mode: stop emitting `None`s
-  - Trigger the drain cascade via `shutdown(immediate=False)` on the first stage's input queue
-  - Wait for all in-flight items to reach terminal state (sink or error handler), then return
-- [ ] `Flow.stop()` — abort:
-  - Call `shutdown(immediate=True)` on every stage's input queue at once — unblocks all `get()` callers immediately
-  - Cancel any worker tasks that are mid-`processing` (in user transformer code)
-  - Each worker's per-worker CM `__aexit__` runs (resources always released)
-  - Return when all workers gone
-- [ ] Tests: `Last(value)` sink sees value last; upstream items dropped; `drain()` waits for in-flight; `stop()` is immediate
+- [x] `Last(value)` wrapper class with `__slots__` and `__repr__`; exported from public API
+- [x] `Last` detection in worker loop: `_handle_last(stage_idx, value)` orchestrates the cascade per the agreed semantics:
+  1. Kill upstream — shutdown queues 0..stage_idx (source's queue + all upstream stages)
+  2. Cancel idle sibling workers in stage_idx (state 3 — safe; busy workers finish their current item naturally)
+  3. Wait until all siblings have exited (`alive == 1`); the last sibling's `finally` sets `last_cascade_event` to wake the cascade-initiator
+  4. Propagate `last_value` to the downstream queue — by this point all sibling results have already entered the queue, so `value` is the absolute last item to arrive
+- [x] Source emits `Dropped(item, "<source>", UPSTREAM_TERMINATED)` events when its `put()` raises `QueueShutDown` (Last cascade, drain, or stop closed the queue mid-iteration)
+- [x] Source generator is closed via `await src_gen.aclose()` in source_task's `finally` so user `try/finally` cleanup inside the source runs
+- [x] `Flow.drain()` — graceful shutdown from outside; shuts down queue 0; pipeline drains via existing cascade; awaits done_event. No-op if no run is active.
+- [x] `Flow.stop()` — immediate abort; shuts down every queue with `immediate=True`; cancels every task in `all_workers` (including busy ones in state 4); per-worker CM `__aexit__` runs because cancellation is inside the `async with` body. No-op if no run is active.
+- [x] `Flow._current_run` field tracks the active `_FlowRun` so `drain`/`stop` can reach it; cleared in a `try/finally` around `runner.execute()`
+- [x] Tests (`tests/test_flow_termination.py` — 9 tests): single-worker Last; multi-worker Last (FINAL is last to enter downstream); Dropped events for source items; drain from outside; drain no-op when no run; stop aborts immediately; stop runs CM `__aexit__` on cancel; stop no-op when no run; Last class basics
+
+Coverage: 93% on `_flow.py`, 96% overall. 93 tests pass in 0.08s. `make lint` clean.
 
 ### M6 — `push()` + `PushHandle`
 

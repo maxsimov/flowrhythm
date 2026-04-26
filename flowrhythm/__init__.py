@@ -11,7 +11,7 @@ from ._errors import (
     SourceError,
     TransformerError,
 )
-from ._flow import Flow, flow, sync_stage
+from ._flow import Flow, Last, flow, sync_stage
 from ._queue import (
     AsyncQueueFactory,
     AsyncQueueInterface,
@@ -33,6 +33,7 @@ __all__ = [
     "Dropped",
     "FixedScaling",
     "Flow",
+    "Last",
     "ScalingStrategy",
     "SourceError",
     "StageSnapshot",
