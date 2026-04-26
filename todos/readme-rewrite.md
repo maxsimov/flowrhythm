@@ -12,7 +12,7 @@ A first-time-reader audit of README.md surfaced 18 items that confuse, repeat, o
 ### Terminology and consistency
 
 - [x] **Pick one term for "the source of items"** — standardized on "source" everywhere. Dropped "producer", "external source", "items source", "source iterator". Kept "source generator" only when being specific about the type, and "Item source" in diagram labels for visual clarity.
-- [x] **Explain why `run(items)` not `run(items())`** — added a callout in the Bounded subsection of "Driving a flow" explaining that the framework owns iteration, plus the runtime contract in DESIGN.md and an item in `migrate-to-flow.md` to enforce with a helpful error message.
+- [x] **Explain why `run(items)` not `run(items())`** — added a callout in the Bounded subsection of "Driving a flow" explaining that the framework owns iteration, plus the runtime contract in DESIGN.md and an item in `implement-runtime.md` to enforce with a helpful error message.
 
 ### Quick Start and onboarding
 
@@ -42,12 +42,12 @@ A first-time-reader audit of README.md surfaced 18 items that confuse, repeat, o
 
 - [x] **`UtilizationScaling` parameters are unexplained** — added inline comments to every parameter in the constructor example, plus a "How it works" section explaining the sampling+cooldown gates and the scale-up/scale-down logic, plus a "Tuning guide" with four common scenarios (bursty, steady, expensive workers, high-throughput).
 - [x] **`Last(value)` is in the API table but never explained in prose** — added a new "Stopping from inside a transformer — `Last(value)`" subsection in "Driving a flow", right before the existing "Stopping a running flow" subsection. Covers use case (terminator-marker pattern), code example, what the user observes, the guarantee, and the `Dropped(...,UPSTREAM_TERMINATED)` events for dropped upstream items.
-- [x] **Clarify `set_error_handler` vs constructor option** — both forms now documented. Constructor accepts `on_error=`, `default_scaling=`, `default_queue=` as shorthand for the corresponding methods. Per-stage configuration remains method-only. Updated DESIGN.md (DSL section), README "Configuring a flow" (split into Constructor keywords / Methods subsections), Public API table, and added an implementation item to `migrate-to-flow.md`.
+- [x] **Clarify `set_error_handler` vs constructor option** — both forms now documented. Constructor accepts `on_error=`, `default_scaling=`, `default_queue=` as shorthand for the corresponding methods. Per-stage configuration remains method-only. Updated DESIGN.md (DSL section), README "Configuring a flow" (split into Constructor keywords / Methods subsections), Public API table, and added an implementation item to `implement-runtime.md`.
 
 ### Production / debugging
 
 - [x] **Add a debugging / dev story.** Both items needed for this — README example showing `dump()` output, and a "debugging" subsection that points to `dump()` as the first thing to try — already exist in [`dump-implementation.md`](dump-implementation.md) under its Documentation section. They'll be done as part of building `dump()` (real output to show, not hypothetical).
-- [x] **No troubleshooting guide.** Moved to [`migrate-to-flow.md`](migrate-to-flow.md) Polish section. Will be written based on real failure modes encountered during implementation and testing — writing it now without a runtime to validate against would be speculative.
+- [x] **No troubleshooting guide.** Moved to [`implement-runtime.md`](implement-runtime.md) Polish section. Will be written based on real failure modes encountered during implementation and testing — writing it now without a runtime to validate against would be speculative.
 
 ### Polish
 

@@ -12,7 +12,7 @@
 
 Both are essential for the developer experience: without `dump()`, users have no way to inspect what their flow actually looks like or what it's doing.
 
-Depends on: `migrate-to-flow.md` (need the flow graph and stats infrastructure first).
+Depends on: `implement-runtime.md` (need the flow graph and stats infrastructure first).
 
 ## Items
 
