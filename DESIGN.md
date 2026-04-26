@@ -619,6 +619,15 @@ When a transformer at stage i returns `Last(value)`:
 
 Backs README guarantee: *"`Last(value)` is final."*
 
+### I11 — `_source_finished` reaches True in every mode
+
+For `_done_event` to fire (and for `run()` / `async with chain.push()` to terminate), `_source_finished` must become True. The mechanism differs by activation mode but the post-condition is identical:
+
+- **Source mode** (`run(source)` / `run()`): `_source_task`'s `finally` block sets `_source_finished = True` when the source generator exhausts, raises (routed to handler), or its `put` is rejected by a shut-down queue.
+- **Push mode** (`async with chain.push() as h:`): there is no `_source_task`. `_source_finished` is set by `PushHandle.complete()` (via `_mark_complete`), `Flow.drain()`, or `Flow.stop()` directly.
+
+Both paths converge on I7's done-condition. Without this invariant, push-mode `drain()` / `stop()` would hang forever (queues shut down, workers exit, alive → 0, but `_source_finished` stays False so `_done_event` never fires).
+
 ---
 
 ## Open questions

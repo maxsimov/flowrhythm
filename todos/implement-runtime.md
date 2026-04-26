@@ -178,13 +178,20 @@ Coverage: 93% on `_flow.py`, 96% overall. 93 tests pass in 0.08s. `make lint` cl
 
 Goal: push-mode activation via `async with chain.push() as h: await h.send(item)`.
 
-- [ ] `PushHandle` class with `send(item)` and `complete()` methods
-- [ ] `Flow.push()` returns `AsyncContextManager[PushHandle]`
-- [ ] `__aenter__` of the CM starts workers and yields the handle
-- [ ] `__aexit__` calls `handle.complete()` then waits for drain
-- [ ] `handle.send(item)` enqueues to first stage's input queue (blocks under backpressure)
-- [ ] `handle.complete()` is idempotent; subsequent `send()` raises
-- [ ] Tests: push items via handle; complete + drain on `async with` exit; abort via `chain.stop()` from another task; `send()` after `complete()` raises
+- [x] `PushHandle` class with `send(item)` and `complete()` methods — `_flow.py`; `__slots__` for the two-field shape; tracks a single `_completed` flag for idempotence
+- [x] `Flow.push()` returns `AsyncContextManager[PushHandle]` — implemented via `@asynccontextmanager` decorator; rejects re-entry when `_current_run is not None` with a clear `RuntimeError`
+- [x] `__aenter__` of the CM starts workers and yields the handle — via `asyncio.create_task(run.execute())` which spawns workers; handle yielded immediately (workers start running on the next event-loop tick when `send()` first awaits)
+- [x] `__aexit__` calls `handle.complete()` then waits for drain — wrapped in nested try/finally so `_current_run` is cleared even if cleanup raises
+- [x] `handle.send(item)` enqueues to first stage's input queue (blocks under backpressure) — delegates to `_FlowRun._push_item()` which puts + notifies the strategy
+- [x] `handle.complete()` is idempotent; subsequent `send()` raises — `_completed` flag short-circuits both methods; `complete()` on an already-completed handle returns silently; `send()` raises `RuntimeError("cannot send() after complete()")`
+- [x] Tests (`tests/test_flow_push.py` — 10 tests): single-stage and multi-stage push; drain on async-with exit (20 items processed); complete idempotence; send-after-complete raises; complete-inside-body works; stop() from another task raises `QueueShutDown` on a blocked send; stop() runs CM `__aexit__`; flow can be reactivated after a clean push session; `PushHandle` is exported
+
+Implementation notes:
+- `_FlowRun` accepts `source: Callable | None` — `None` is the push-mode signal. `execute()` skips spawning `_source_task` when source is None.
+- `drain()` and `stop()` set `_source_finished = True` themselves in push mode (no `_source_task.finally` to do it). Without this fix, `_done_event` would never fire in push mode. Captured as new invariant I11.
+- `PushHandle.complete()` calls `_FlowRun._mark_complete()`, which is just state mutation (`_source_finished = True`, queue shutdown, cascade trigger) — the actual drain happens via the existing cascade.
+
+Coverage: 95% overall (93% on `_flow.py`). 103 tests pass in 0.09s. `make lint` clean.
 
 ### M7 — Sub-flow inlining
 
