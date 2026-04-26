@@ -9,7 +9,7 @@ Current `flowrhythm/_builder.py` is the legacy `Builder` DSL. The README documen
 
 This is a from-scratch rebuild of the runtime. `_builder.py` will be replaced; existing tests in `tests/test_builder.py` are skipped at module level pending rewrite.
 
-See `ROADMAP.md` for the design that this implements.
+See `DESIGN.md` for the design that this implements.
 
 ## Items
 
@@ -23,7 +23,7 @@ See `ROADMAP.md` for the design that this implements.
 
 ### Construction-time logic
 
-- [ ] Stage role detection per ROADMAP "Stage role detection" section — reject async generators with clear `TypeError`, dispatch by signature inspection
+- [ ] Stage role detection per DESIGN.md "Stage role detection" section — reject async generators with clear `TypeError`, dispatch by signature inspection
 - [ ] Auto-derive stage names from function names; numeric suffix on collisions
 - [ ] Reject sync functions and sync context managers with error pointing to `asyncio.to_thread` or `sync_stage()` helper
 - [ ] Sub-flow expansion — when a `Flow` is in another `flow()` args, inline its stages with namespaced names (`inner.stage_name`)
@@ -35,8 +35,8 @@ See `ROADMAP.md` for the design that this implements.
 - [ ] Per-stage worker pool — spawn N workers based on scaling strategy
 - [ ] Per-worker async context manager lifecycle (acquire on spawn, release on stop)
 - [ ] Wire `ScalingStrategy.on_enqueue` / `on_dequeue` to actual worker spawn/kill
-- [ ] Bounded queue between stages (default size — see ROADMAP open question on backpressure)
-- [ ] EOF/drain cascade — close-style queue OR N-sentinel approach (see ROADMAP)
+- [ ] Bounded queue between stages (default size — see DESIGN.md open question on backpressure)
+- [ ] EOF/drain cascade — close-style queue OR N-sentinel approach (see DESIGN.md)
 - [ ] `Last(value)` handling — output `value`, then close upstream queue, drop in-flight upstream items as `Dropped(..., UPSTREAM_TERMINATED)`
 
 ### Activation modes

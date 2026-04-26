@@ -32,14 +32,25 @@ Pipeline DSL for chaining async stages (producer → transformers → sink) with
 - Document what the user **writes**, what they **observe**, and what the framework **guarantees** — never how it's implemented
 - Words like *queue*, *worker*, *sentinel*, *close()* are implementation details. Avoid them in user-facing docs unless the user can directly observe or configure them (e.g., they can configure a queue *type*, but they don't see queue close events)
 - When explaining a feature, write each step as either "the user does X" or "the user observes Y", not "the framework calls Z internally"
-- Implementation mechanics belong in ROADMAP or code comments, not in the README
+- Implementation mechanics belong in DESIGN.md or code comments, not in the README
 
-## Roadmap
+## Project documents
 
-- ROADMAP.md tracks decided design, open questions, and implementation backlog
-- Read it at the start of any non-trivial design or implementation work to know current state
-- Update it when: a design decision is made, an open question is resolved, work moves between backlog/done, or new work is identified
-- Move completed items to the "Done" section rather than deleting
+There are three layers of documentation, each with its own audience:
+
+| File | For | What it contains |
+|---|---|---|
+| `README.md` | Users | How to use the library |
+| `DESIGN.md` | Implementers | Design contract — how things should behave, why decisions were made, open questions, deferred ideas |
+| `todos/INDEX.md` + plan files | Maintainers | Concrete implementation work, in priority order, with checklists |
+
+### DESIGN.md
+
+- The source of truth for **how the library should behave**
+- Read it at the start of any non-trivial design or implementation work
+- Update it when: a design decision is made, an open question is resolved, a deferred idea is reconsidered
+- Do **not** put implementation tasks here — those go in `todos/`
+- DESIGN.md says "the rule"; `todos/` says "what we're doing about it"
 
 ## TODO plans
 

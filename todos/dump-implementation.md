@@ -20,7 +20,7 @@ Depends on: `migrate-to-flow.md` (need the flow graph and stats infrastructure f
 
 - [ ] Implement `Flow.dump(mode="structure")` returning structure representation
 - [ ] Implement `Flow.dump(mode="stats")` returning live runtime stats
-- [ ] Decide and implement output format(s) — see ROADMAP open question (`JSON`, `mermaid`, plain text, or all three)
+- [ ] Decide and implement output format(s) — see DESIGN.md open question (`JSON`, `mermaid`, plain text, or all three)
 
 ### Structure mode
 

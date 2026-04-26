@@ -12,7 +12,7 @@ A first-time-reader audit of README.md surfaced 18 items that confuse, repeat, o
 ### Terminology and consistency
 
 - [x] **Pick one term for "the source of items"** — standardized on "source" everywhere. Dropped "producer", "external source", "items source", "source iterator". Kept "source generator" only when being specific about the type, and "Item source" in diagram labels for visual clarity.
-- [x] **Explain why `run(items)` not `run(items())`** — added a callout in the Bounded subsection of "Driving a flow" explaining that the framework owns iteration, plus the runtime contract in ROADMAP and an item in `migrate-to-flow.md` to enforce with a helpful error message.
+- [x] **Explain why `run(items)` not `run(items())`** — added a callout in the Bounded subsection of "Driving a flow" explaining that the framework owns iteration, plus the runtime contract in DESIGN.md and an item in `migrate-to-flow.md` to enforce with a helpful error message.
 
 ### Quick Start and onboarding
 
@@ -52,7 +52,7 @@ A first-time-reader audit of README.md surfaced 18 items that confuse, repeat, o
 ### Polish
 
 - [ ] **Markdown rendering risk in tables** — escaped `\|` pipes in cells like `dump(mode="structure" \| "stats")` look ugly. Rewrite as separate column or note.
-- [ ] **Push-mode "Why a separate `PushHandle`?" subsection** is design rationale that doesn't help users — move to ROADMAP, leave a one-liner in README.
+- [ ] **Push-mode "Why a separate `PushHandle`?" subsection** is design rationale that doesn't help users — move to DESIGN.md, leave a one-liner in README.
 - [ ] **Consider whether two mermaid diagrams in Architecture are too much** — the class diagram has 8+ entities and signals "complex framework" to evaluators. Either simplify or remove the class diagram (keep the Pipeline Flow one).
 
 ## Done

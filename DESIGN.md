@@ -1,6 +1,10 @@
-# Roadmap
+# Design
 
-Tracks design decisions, open questions, and implementation work for flowrhythm.
+The design contract for flowrhythm — what's been decided, what's still open, and what's deferred for later.
+
+This is the source of truth for **how the library should behave**. The README documents the user-facing surface; this document documents the rules behind it.
+
+For concrete implementation work and progress tracking, see [`todos/INDEX.md`](todos/INDEX.md).
 
 ---
 
@@ -214,45 +218,10 @@ class Dropped:
 
 ---
 
-## Implementation backlog
+## Implementation work
 
-### Core migration (current code uses `Builder` DSL, README documents `flow()`)
-- [ ] Replace `_builder.py` with `flow()` function
-- [ ] Implement role detection (async generator → producer; last stage → sink)
-- [ ] Implement auto-naming + collision suffixing
-- [ ] Implement `stage(fn, name=...)` wrapper
-- [ ] Implement `router(classifier, **arms, default=...)`
-- [ ] Make `Flow` introspectable as a transformer
-- [ ] Update `__init__.py` exports: `flow`, `router`, `stage`, `Flow`, scaling classes, queue factories
+Concrete, trackable implementation tasks live in [`todos/INDEX.md`](todos/INDEX.md). Active plans:
 
-### Flow runtime
-- [ ] Implement `Flow.start() / join() / stop() / run()`
-- [ ] Wire scaling strategies to actual worker spawn/kill
-- [ ] Implement per-worker async context manager lifecycle
-- [ ] Implement `Flow.configure() / configure_default()`
-- [ ] Implement `Flow.set_error_handler()`
-
-### Diagnostics
-- [ ] Implement `Flow.dump()` — structure mode (graph as text/mermaid)
-- [ ] Implement `Flow.dump()` — stats mode (live runtime stats)
-
-### Tests
-- [ ] `tests/test_builder.py` is currently skipped at module level (Builder DSL is being replaced) — rewrite against `flow()` API once it exists
-- [ ] Add tests for sub-flow composition
-- [ ] Add tests for router (incl. default and unknown-label-raises)
-- [ ] Add tests for per-worker context manager scope
-- [ ] Add tests for `run(producer)`, `run()` (auto-trigger), `async with` + `send()` push mode
-- [ ] Add tests for "async generator passed to flow() raises TypeError"
-
-### Polish
-- [ ] Implement `sync_stage(fn)` helper — wraps a sync function with `asyncio.to_thread` so users can opt into running sync code as a transformer
-- [ ] Fix mutable-default bug in `_builder.py` (`_Branch.options`, `_Branch.arm`) — moot if `_builder.py` is replaced
-- [ ] Decide on Python target (currently `>=3.12` per `pyproject.toml`)
-
----
-
-## Done
-
-- Migrated build system from Poetry to uv/hatchling
-- Created CLAUDE.md with project conventions
-- Drafted README with new `flow()` DSL design
+- [`migrate-to-flow`](todos/migrate-to-flow.md) — rebuild the runtime to match the documented `flow()` API
+- [`dump-implementation`](todos/dump-implementation.md) — implement `Flow.dump()` in structure and stats modes
+- [`readme-rewrite`](todos/readme-rewrite.md) — clean up the README for newcomer evaluators

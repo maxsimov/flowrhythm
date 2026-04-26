@@ -951,7 +951,7 @@ Item source is one of:
 
 ## Project status
 
-flowrhythm is in early development. The DSL and runtime are still settling — see [`ROADMAP.md`](ROADMAP.md) for design decisions and open questions, and [`todos/INDEX.md`](todos/INDEX.md) for active plans (in priority order).
+flowrhythm is in early development. The DSL and runtime are still settling — see [`DESIGN.md`](DESIGN.md) for design decisions and open questions, and [`todos/INDEX.md`](todos/INDEX.md) for active plans (in priority order).
 
 ---
 
