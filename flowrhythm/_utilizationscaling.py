@@ -33,6 +33,9 @@ class UtilizationScaling:
         self._last_sampled_at = 0.0
         self._event_count = 0
 
+    def initial_workers(self) -> int:
+        return self.min_workers
+
     def _should_sample(self):
         now = time.monotonic()
         if self.sampling_events is not None:

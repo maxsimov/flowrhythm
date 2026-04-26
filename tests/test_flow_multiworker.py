@@ -1,12 +1,11 @@
 """Tests for M2a — multi-worker stages and the drain cascade with N>1.
 
-For now, worker count is set via the hidden `_workers_per_stage` kwarg to
-`flow()`. M2b will replace this with the public `configure()` API.
+Worker count is set via the public `configure_default()` API (M2b).
 """
 
 import asyncio
 
-from flowrhythm import flow
+from flowrhythm import FixedScaling, flow
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +29,7 @@ async def test_multi_worker_stage_processes_all_items():
         for i in range(100):
             yield i
 
-    chain = flow(double, collect, _workers_per_stage=4)
+    chain = flow(double, collect, default_scaling=FixedScaling(workers=4))
     await chain.run(items)
 
     expected = sorted(i * 2 for i in range(100))
@@ -78,7 +77,7 @@ async def test_workers_run_concurrently():
         for i in range(10):
             yield i
 
-    chain = flow(slow, sink, _workers_per_stage=4)
+    chain = flow(slow, sink, default_scaling=FixedScaling(workers=4))
     async with asyncio.timeout(2):  # safety net against deadlock; not measuring time
         await chain.run(items)
 
@@ -87,7 +86,7 @@ async def test_workers_run_concurrently():
 
 
 async def test_default_remains_single_worker():
-    """No _workers_per_stage kwarg → still 1 worker per stage (preserves M1 ordering)."""
+    """No scaling configured → still 1 worker per stage (preserves M1 ordering)."""
     received = []
 
     async def double(x):
@@ -100,7 +99,7 @@ async def test_default_remains_single_worker():
         for i in range(50):
             yield i
 
-    chain = flow(double, collect)  # no kwarg → default
+    chain = flow(double, collect)  # no scaling config → default FixedScaling(1)
     await chain.run(items)
 
     # Single worker per stage preserves order
@@ -131,7 +130,7 @@ async def test_drain_cascade_with_multiple_workers_per_stage():
         for i in range(50):
             yield i
 
-    chain = flow(t1, t2, collect, _workers_per_stage=4)
+    chain = flow(t1, t2, collect, default_scaling=FixedScaling(workers=4))
     # If the cascade is broken (e.g., shutdown isn't called when alive count
     # hits 0), this will hang and pytest will time out. The fact that run()
     # returns at all proves the multi-worker drain cascade works.
@@ -156,7 +155,7 @@ async def test_drain_cascade_with_empty_source_and_many_workers():
         return
         yield  # unreachable
 
-    chain = flow(passthrough, collect, _workers_per_stage=8)
+    chain = flow(passthrough, collect, default_scaling=FixedScaling(workers=8))
     await chain.run(items)
 
     assert received == []

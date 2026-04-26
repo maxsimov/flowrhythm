@@ -76,15 +76,21 @@ Coverage: 97% on `_flow.py`. 50 tests pass in 0.07s.
 
 Goal: users can specify per-stage scaling/queue and pipeline-wide defaults; the M2a worker pool consumes those settings.
 
-- [ ] `Flow.configure(name, *, scaling=None, queue=None, queue_size=None)` — per-stage tuning; supports namespaced names like `"inner.decode"` (sub-flow names won't be resolvable until M7 but the storage shape should be ready)
-- [ ] `Flow.configure_default(*, scaling=None, queue=None, queue_size=None)` — pipeline-wide defaults
-- [ ] `flow(*stages, default_scaling=None, default_queue=None, default_queue_size=None)` — constructor kwargs equivalent to `configure_default`
-- [ ] At `run()` time, resolve effective config per stage: per-stage override → pipeline default → built-in default (`FixedScaling(1)`, `fifo_queue`, `maxsize=1`)
-- [ ] Update `FixedScaling` so it actually targets N workers (currently it returns 0 forever — a stub from the legacy code)
-- [ ] Test: `flow(...).configure(name, scaling=FixedScaling(4))` results in 4 workers for that stage
-- [ ] Test: `flow(*, default_scaling=FixedScaling(2))` applies to all stages
-- [ ] Test: per-stage override beats default
-- [ ] Test: configuring an unknown stage name — what happens? (Open question per DESIGN.md; for now: silently store, no error. Resolve later.)
+- [x] `Flow.configure(name, *, scaling=None, queue=None, queue_size=None)` — per-stage tuning; supports namespaced names (storage is just a dict keyed by name, so sub-flow paths like `"inner.decode"` work without further changes)
+- [x] `Flow.configure_default(*, scaling=None, queue=None, queue_size=None)` — pipeline-wide defaults
+- [x] `flow(*stages, default_scaling=None, default_queue=None, default_queue_size=None)` — constructor kwargs equivalent to `configure_default`
+- [x] At `run()` time, resolve effective config per stage: per-stage override → pipeline default → built-in default (`FixedScaling(workers=1)`, `fifo_queue`, `maxsize=1`)
+- [x] Updated `FixedScaling` — now requires `workers: int >= 1` (raises `ValueError` on 0; pointer to `UtilizationScaling` for scale-to-zero); added `initial_workers()` method
+- [x] Added `initial_workers()` method to `UtilizationScaling` (returns `self.min_workers`); added it to the `ScalingStrategy` Protocol so the runtime can query worker counts uniformly
+- [x] Removed the M2a-only `_workers_per_stage` hidden kwarg; M2a tests migrated to use `default_scaling=FixedScaling(workers=N)`
+- [x] Test: `chain.configure(name, scaling=FixedScaling(workers=4))` results in 4 workers for that stage (proven via the same in-flight barrier as M2a)
+- [x] Test: `flow(*, default_scaling=...)` and `chain.configure_default(scaling=...)` apply to all stages
+- [x] Test: per-stage override beats pipeline default
+- [x] Test: `default_queue=lifo_queue`, `default_queue_size=N`, `configure(name, queue_size=N)` all wire through without crashing
+- [x] Test: `FixedScaling(workers=0)` raises
+- [x] Test: configuring an unknown stage name silently stores (no error); pipeline still runs
+
+Coverage: 95% on `_flow.py`, 96% overall. 61 tests pass in 0.05s.
 
 ### M2c — UtilizationScaling integration
 

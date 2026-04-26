@@ -1,9 +1,10 @@
-"""Linear flow runtime (M1 + M2a).
+"""Linear flow runtime (M1 + M2a + M2b).
 
-A `Flow` holds a list of named stages and a `run(source)` method that drives
-them. Each stage may have N workers (configurable as of M2a). CM factories,
-sub-flows, routers, push mode, public configure() API, and error handling
-all come in later milestones.
+A `Flow` holds a list of named stages, per-stage and pipeline-wide
+configuration, and a `run(source)` method that drives the pipeline. Each
+stage runs N workers per its `ScalingStrategy.initial_workers()`. CM
+factories, sub-flows, routers, push mode, and error handling all come in
+later milestones.
 
 End-of-stream propagates via stdlib `asyncio.Queue.shutdown()` (see
 DESIGN.md "EOF / drain cascade"). Each stage tracks its alive worker count;
@@ -15,7 +16,8 @@ import asyncio
 import inspect
 from typing import Any, AsyncGenerator, Callable
 
-from flowrhythm._queue import fifo_queue
+from flowrhythm._queue import AsyncQueueFactory, fifo_queue
+from flowrhythm._scaling import FixedScaling, ScalingStrategy
 
 
 class Flow:
@@ -24,14 +26,75 @@ class Flow:
     def __init__(
         self,
         stages: list[tuple[str, Callable[[Any], Any]]],
-        workers_per_stage: int = 1,
+        default_scaling: ScalingStrategy | None = None,
+        default_queue: AsyncQueueFactory | None = None,
+        default_queue_size: int | None = None,
     ) -> None:
         self._stages = stages
-        self._workers_per_stage = workers_per_stage
+        self._default_config: dict[str, Any] = {}
+        if default_scaling is not None:
+            self._default_config["scaling"] = default_scaling
+        if default_queue is not None:
+            self._default_config["queue"] = default_queue
+        if default_queue_size is not None:
+            self._default_config["queue_size"] = default_queue_size
+        self._stage_config: dict[str, dict[str, Any]] = {}
 
     @property
     def stage_names(self) -> list[str]:
         return [name for name, _ in self._stages]
+
+    def configure(
+        self,
+        name: str,
+        *,
+        scaling: ScalingStrategy | None = None,
+        queue: AsyncQueueFactory | None = None,
+        queue_size: int | None = None,
+    ) -> None:
+        """Set per-stage scaling, queue type, and/or queue size.
+
+        `None` means "no override" (keep whatever was there or fall back to
+        defaults). Unknown stage names are silently stored — see DESIGN.md
+        open question; this may change later.
+        """
+        cfg = self._stage_config.setdefault(name, {})
+        if scaling is not None:
+            cfg["scaling"] = scaling
+        if queue is not None:
+            cfg["queue"] = queue
+        if queue_size is not None:
+            cfg["queue_size"] = queue_size
+
+    def configure_default(
+        self,
+        *,
+        scaling: ScalingStrategy | None = None,
+        queue: AsyncQueueFactory | None = None,
+        queue_size: int | None = None,
+    ) -> None:
+        """Set pipeline-wide defaults. Per-stage `configure()` overrides these."""
+        if scaling is not None:
+            self._default_config["scaling"] = scaling
+        if queue is not None:
+            self._default_config["queue"] = queue
+        if queue_size is not None:
+            self._default_config["queue_size"] = queue_size
+
+    def _resolve_config(self, name: str) -> dict[str, Any]:
+        """Per-stage override → pipeline default → built-in default."""
+        per_stage = self._stage_config.get(name, {})
+        return {
+            "scaling": per_stage.get("scaling")
+            or self._default_config.get("scaling")
+            or FixedScaling(workers=1),
+            "queue": per_stage.get("queue")
+            or self._default_config.get("queue")
+            or fifo_queue,
+            "queue_size": per_stage.get("queue_size")
+            or self._default_config.get("queue_size")
+            or 1,
+        }
 
     async def run(self, source: Callable[[], AsyncGenerator[Any, None]]) -> None:
         """Drive the chain by iterating `source` and pushing items through.
@@ -56,15 +119,16 @@ class Flow:
     async def _start_and_join(
         self, source: Callable[[], AsyncGenerator[Any, None]]
     ) -> None:
-        # N stages → N input queues. queues[i] is stage[i]'s input.
-        # The source feeds queues[0]. The last stage's result is dropped.
+        # Resolve effective config per stage and build queues + worker counts.
         n = len(self._stages)
-        queues = [fifo_queue() for _ in range(n)]
+        configs = [self._resolve_config(name) for name, _ in self._stages]
+        queues = [c["queue"](maxsize=c["queue_size"]) for c in configs]
+        worker_counts = [c["scaling"].initial_workers() for c in configs]
 
         # Per-stage alive-worker counter. When it hits 0, the worker that
         # decremented to 0 shuts down the next queue — cascading drain.
         # asyncio is single-threaded cooperative, so plain ints are safe.
-        alive = [self._workers_per_stage] * n
+        alive = list(worker_counts)
 
         async def source_task() -> None:
             try:
@@ -100,7 +164,7 @@ class Flow:
 
         tasks = [asyncio.create_task(source_task())]
         for stage_idx in range(n):
-            for _ in range(self._workers_per_stage):
+            for _ in range(worker_counts[stage_idx]):
                 tasks.append(asyncio.create_task(worker_task(stage_idx)))
 
         await asyncio.gather(*tasks)
@@ -108,13 +172,18 @@ class Flow:
 
 def flow(
     *stages: Callable[[Any], Any],
-    _workers_per_stage: int = 1,
+    default_scaling: ScalingStrategy | None = None,
+    default_queue: AsyncQueueFactory | None = None,
+    default_queue_size: int | None = None,
 ) -> Flow:
     """Construct a flow from a sequence of async transformer functions.
 
     Each stage must be an async function taking exactly one argument (the
     item) and returning one item. The last stage acts as the sink — its
     return value is dropped.
+
+    The optional `default_*` kwargs are shorthand for calling
+    `configure_default(...)` on the resulting Flow.
 
     Validation rules (per DESIGN.md):
     - Async generators are rejected — they are sources, not stages, and
@@ -125,10 +194,6 @@ def flow(
 
     Stage names are auto-derived from function names; collisions get a
     numeric suffix (`normalize`, `normalize_2`, ...).
-
-    `_workers_per_stage` is a private M2a hook for testing multi-worker
-    behavior before the public `configure()` API lands in M2b. Will be
-    removed once `configure()` exists.
     """
     if not stages:
         raise TypeError("flow() requires at least one stage")
@@ -169,4 +234,9 @@ def flow(
         name = base if counts[base] == 1 else f"{base}_{counts[base]}"
         named.append((name, fn))
 
-    return Flow(stages=named, workers_per_stage=_workers_per_stage)
+    return Flow(
+        stages=named,
+        default_scaling=default_scaling,
+        default_queue=default_queue,
+        default_queue_size=default_queue_size,
+    )

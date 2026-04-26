@@ -1,3 +1,14 @@
+"""Scaling strategies for stage worker pools.
+
+A `ScalingStrategy` decides how many workers a stage runs. The runtime
+queries `initial_workers()` at startup and (in M2c) calls `on_enqueue()` /
+`on_dequeue()` on every item event to adjust the worker count dynamically.
+
+Built-in strategies:
+- `FixedScaling(workers=N)` — constant N workers; never scales.
+- `UtilizationScaling(...)` — adjusts based on busy/idle ratio (see `_utilizationscaling.py`).
+"""
+
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -26,13 +37,37 @@ class StageStats:
 
 
 class ScalingStrategy(Protocol):
-    async def on_enqueue(self, stats: StageStats) -> int: ...
-    async def on_dequeue(self, stats: StageStats) -> int: ...
+    """Protocol for stage worker-pool sizing strategies."""
+
+    def initial_workers(self) -> int:
+        """Number of workers to spawn when the stage starts."""
+
+    async def on_enqueue(self, stats: StageStats) -> int:
+        """Return delta to apply on item-enqueue events. Positive = add, negative = remove."""
+
+    async def on_dequeue(self, stats: StageStats) -> int:
+        """Return delta to apply on item-dequeue events. Positive = add, negative = remove."""
 
 
 class FixedScaling:
+    """Constant N workers per stage. Never scales after startup.
+
+    Use `UtilizationScaling` if you want dynamic scaling (including scale-to-zero).
+    """
+
+    def __init__(self, workers: int) -> None:
+        if workers < 1:
+            raise ValueError(
+                f"FixedScaling requires workers >= 1 (got {workers}); "
+                "use UtilizationScaling(min_workers=0) for scale-to-zero"
+            )
+        self.workers = workers
+
+    def initial_workers(self) -> int:
+        return self.workers
+
     async def on_enqueue(self, stats: StageStats) -> int:
-        return 0  # never scale (stub)
+        return 0  # never scales
 
     async def on_dequeue(self, stats: StageStats) -> int:
-        return 0  # never scale (stub)
+        return 0  # never scales
