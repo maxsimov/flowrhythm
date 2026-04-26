@@ -106,6 +106,20 @@ Sync functions and sync context managers are rejected with a clear error pointin
 
 The **last stage** in `flow()` plays the sink role when run autonomously — its output is dropped. When the same flow is used as a transformer in another flow, the last stage's output is forwarded to the parent's downstream queue. No marking required.
 
+### Source argument shape (run)
+`run(source)` accepts only the generator function (or CM factory) — never an already-instantiated generator. Rationale:
+- Framework owns iteration, allowing future re-iteration / retry semantics
+- Symmetry with CM-factory sources (which must be factories)
+- Prevents footgun where a generator would be partially consumed before `run()` is called
+
+If user passes a called generator (`items()`), framework raises:
+```
+TypeError: pass the generator function, not the called generator.
+e.g., chain.run(my_items)  not  chain.run(my_items())
+```
+
+Detection: if `inspect.isasyncgen(source)` (instantiated generator), raise. If `inspect.isasyncgenfunction(source)` (function), accept. If callable returning AsyncContextManager (CM factory), accept.
+
 ### Scaling
 - **Producers** always have exactly one worker (cannot scale). Async generators are not safe to consume concurrently — duplicates or races.
 - For parallel ingestion (Kafka consumer, paginated API), use a trigger producer + multi-worker transformer pattern:

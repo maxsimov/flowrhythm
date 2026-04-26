@@ -42,6 +42,7 @@ See `ROADMAP.md` for the design that this implements.
 ### Activation modes
 
 - [ ] `Flow.run(source)` — bounded; consume async generator with one task; close on exhaustion
+- [ ] `Flow.run(source)` — reject already-instantiated generators (`isinstance` check); raise `TypeError` with helpful message: "pass the generator function, not the called generator. e.g., chain.run(my_items) not chain.run(my_items())"
 - [ ] `Flow.run()` — unbounded; auto-emit `None` to first stage; runs until `stop()`/`drain()`
 - [ ] `Flow.run(source)` for CM-factory source — call factory, enter context, iterate inner generator
 - [ ] `Flow.push()` — return `AsyncContextManager[PushHandle]`

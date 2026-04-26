@@ -1,6 +1,6 @@
 # README rewrite
 
-**Status:** planned
+**Status:** in-progress
 **Updated:** 2026-04-26
 
 ## Motivation
@@ -11,24 +11,24 @@ A first-time-reader audit of README.md surfaced 18 items that confuse, repeat, o
 
 ### Terminology and consistency
 
-- [ ] **Pick one term for "the source of items"** — currently mixes "producer", "source", "source iterator", "source generator", "items source", "external source." Pick one (probably "source") and use it everywhere.
-- [ ] **Explain why `run(items)` not `run(items())`** — every example passes the function reference, never the call. Add one-line note (e.g., "framework controls iteration / can re-iterate"), or change the API to accept the called generator if simpler.
+- [x] **Pick one term for "the source of items"** — standardized on "source" everywhere. Dropped "producer", "external source", "items source", "source iterator". Kept "source generator" only when being specific about the type, and "Item source" in diagram labels for visual clarity.
+- [x] **Explain why `run(items)` not `run(items())`** — added a callout in the Bounded subsection of "Driving a flow" explaining that the framework owns iteration, plus the runtime contract in ROADMAP and an item in `migrate-to-flow.md` to enforce with a helpful error message.
 
 ### Quick Start and onboarding
 
-- [ ] **Quick Start should be a 5-line example.** Currently it has 5 functions and a router. Lead with `flow(transform).run(source)`. Routing belongs in a second example.
-- [ ] **Add a "When to use / vs alternatives" section.** Compare to Celery, Faust, raw asyncio.Queue. Without this, new users default to what they know.
-- [ ] **Move or rephrase the Scope callout.** Currently the first thing after the tagline is "what flowrhythm is NOT for." Lead with what it IS for, then narrow scope.
+- [x] **Quick Start should be a 5-line example.** Replaced with a 3-function minimal example (`double`, `write`, `items`) and a single `flow(double, write).run(items)` call. Routing/scaling/etc. now point to dedicated sections.
+- [x] **Add a "When to use / vs alternatives" section.** Added between Scope and Contents. Three-question framing: when it fits / when it doesn't, then "why not asyncio.Queue / Celery / Faust." Linked from the Contents.
+- [x] **Move or rephrase the Scope callout.** Deleted entirely. The new "When to use flowrhythm" section that follows the tagline covers the same ground (CPU-bound warning is in the "wrong fit" bullets) with positive framing first.
 
 ### Duplication and structure
 
-- [ ] **Routing is explained twice** — Stages → Router subsection and Designing a flow → Routing subsection. Pick one canonical location, link from the other.
-- [ ] **Sub-flow composition is explained 2-3 times** — Stages → Transformer table, Stages → Sub-flow section, Designing a flow → Composing flows. Consolidate.
-- [ ] **CM factory examples appear in 3 sections** — Stages → Transformer Examples, Stages → How a worker invokes → CM factory. Pick one and link.
+- [x] **Routing is explained twice** — consolidated at "Designing a flow → Routing" (now the canonical location with signature, params, example, runtime graph, and miss behavior). Stages → Router subsection deleted; the "How a worker invokes" Router entry shrunk to a one-line pointer to Routing. Stages → Transformer table row links to Routing.
+- [x] **Sub-flow composition is explained 2-3 times** — consolidated at "Designing a flow → Composing flows" (effective graph + namespacing + standalone-vs-composed). Stages → Sub-flow shrunk to a one-line pointer. Deleted the redundant "Reusable as a transformer" subsection in Designing a flow. Stages → Transformer table row links to Composing flows.
+- [x] **CM factory examples appear in 3 sections** — restructured Stages → Transformer "Examples" block: replaced one big mashup (5 things wired together, including unused `WithDB` class) with one focused snippet per shape. Each shape now has its own minimal, self-contained example. Sub-flow and router examples are one-liners that point to their canonical sections (Composing flows / Routing). Driving a flow → "Source can be a CM factory" stays — it's a different topic.
 
 ### Implementation leakage in user-facing prose
 
-- [ ] **Remove pseudocode with `my_queue.get()` / `next_queue.put()` / `running` flag** from "How a worker invokes each shape." This is implementation detail, contradicts CLAUDE.md "describe behavior from the user's perspective" rule. Replace with a user-perspective description.
+- [x] **Remove pseudocode with `my_queue.get()` / `next_queue.put()` / `running` flag** from "How a worker invokes each shape." Renamed section to "How each shape behaves at runtime." Each subsection now describes what the user observes and what the framework guarantees, with no implementation pseudocode. Router pseudocode was already removed in item 6.
 
 ### Bugs in examples
 
