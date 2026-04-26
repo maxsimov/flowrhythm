@@ -9,7 +9,7 @@ This is the source of truth for **how the library should behave**. The README do
 ## Decided design
 
 ### DSL
-- Single entry point: `flow(*stages, on_error=None, default_scaling=None, default_queue=None)` — lowercase function, returns a `Flow` instance
+- Single entry point: `flow(*stages, on_error=None, default_scaling=None, default_queue=None, default_queue_size=None)` — lowercase function, returns a `Flow` instance
 - `Flow` (uppercase class) is exported for type hints only — users always construct via `flow(...)`, never via `Flow(...)`
 - No separate `pipe()` / `Builder` concept — `flow()` is both structure and runnable
 - **`flow()` accepts only transformers as positional args** — passing an async generator at any position is an error; the producer is supplied separately via `run()`
@@ -17,10 +17,11 @@ This is the source of truth for **how the library should behave**. The README do
 - Stage names auto-derived from function names; collisions get numeric suffix; override via `stage(fn, name=...)`
 
 #### Flow-level config: constructor kwargs vs methods
-The constructor accepts three keyword arguments as shorthand:
+The constructor accepts four keyword arguments as shorthand:
 - `on_error=` — equivalent to calling `chain.set_error_handler(handler)` after construction
 - `default_scaling=` — equivalent to `chain.configure_default(scaling=...)`
 - `default_queue=` — equivalent to `chain.configure_default(queue=...)`
+- `default_queue_size=` — equivalent to `chain.configure_default(queue_size=...)`
 
 Both forms are fully equivalent. Use the constructor form for one-shot setup; use the methods for incremental configuration (e.g., when reading from a config file). Per-stage configuration (`chain.configure("stage_name", ...)`) is method-only — there's no way to express it via constructor kwargs.
 
@@ -181,8 +182,10 @@ Detection: if `inspect.isasyncgen(source)` (instantiated generator), raise. If `
 - Validation at construction; raise `ValueError` on invalid combinations
 
 ### Configuration (separate from definition)
-- `flow.configure(name, scaling=..., queue=...)` — per-stage tuning
-- `flow.configure_default(scaling=..., queue=...)` — pipeline-wide defaults
+- `flow.configure(name, scaling=..., queue=..., queue_size=...)` — per-stage tuning
+- `flow.configure_default(scaling=..., queue=..., queue_size=...)` — pipeline-wide defaults
+
+`queue=` is a queue **factory** (e.g. `fifo_queue`, `priority_queue`); `queue_size=` is the queue's `maxsize`. The two are independent — set either or both. Internally the framework calls `queue(maxsize=queue_size)` to build the per-stage instance. For exotic queue configs (e.g. priority queue with custom comparator), pass a pre-configured factory in `queue=` and omit `queue_size`.
 - `flow.set_error_handler(handler)` — one per pipeline, last resort
 
 ### Architecture rules
@@ -274,7 +277,7 @@ class Dropped:
 - **`chain.run(source)` returns naturally** when source generator completes — graceful drain.
 - **`chain.drain()`** — graceful from outside (only meaningful in unbounded `run()` mode where there's no source the user controls).
 - **`chain.stop()`** — immediate abort; resources released, items in flight dropped.
-- **Source generator raises** — abort by default (re-raise from `run()`); user can wrap source for retry.
+- **Source generator raises** — handler receives a `SourceError` event. Default handler logs to stderr and lets the pipeline drain (source is treated as exhausted). To abort instead, call `Flow.stop()` from outside the run.
 
 ### Lifecycle
 - Public API: `run(source)`, `run()`, `push()`, `drain()`, `stop()` only
@@ -508,8 +511,8 @@ classDiagram
         +push() AsyncContextManager~PushHandle~
         +drain()
         +stop()
-        +configure(name, scaling, queue)
-        +configure_default(scaling, queue)
+        +configure(name, scaling, queue, queue_size)
+        +configure_default(scaling, queue, queue_size)
         +set_error_handler(handler)
         +dump(mode)
     }

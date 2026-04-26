@@ -94,7 +94,7 @@ Each stage owns:
 - **Worker pool** — N async tasks pulling from the input queue, processing items, pushing results into the **next stage's input queue**
 - **Scaling strategy** — decides N based on live stats (queue length, worker utilization)
 
-A queue lives **between** two stages. The downstream stage owns it. Configuring a queue (`flow.configure("normalize", queue=priority_queue)`) configures that stage's *input* queue — which is the upstream stage's destination.
+A queue lives **between** two stages. The downstream stage owns it. Configuring a queue (`flow.configure("normalize", queue=priority_queue, queue_size=10)`) configures that stage's *input* queue — which is the upstream stage's destination.
 
 ```
                                     ┌─ stage owns input queue ─┐
@@ -421,11 +421,12 @@ chain = flow(
     on_error=on_error,
     default_scaling=FixedScaling(workers=2),
     default_queue=priority_queue,
+    default_queue_size=10,
 )
 await chain.run(items)
 ```
 
-`on_error`, `default_scaling`, and `default_queue` cover **flow-level** configuration. Per-stage configuration (different scaling for one specific stage) needs the method form.
+`on_error`, `default_scaling`, `default_queue`, and `default_queue_size` cover **flow-level** configuration. Per-stage configuration (different scaling for one specific stage) needs the method form.
 
 ### Methods (incremental)
 
@@ -439,7 +440,8 @@ chain.configure_default(scaling=FixedScaling(workers=2))
 
 # Per-stage tuning (only via method — no constructor shorthand)
 chain.configure("normalize", scaling=UtilizationScaling(max_workers=8))
-chain.configure("normalize", queue=priority_queue)
+chain.configure("normalize", queue=priority_queue, queue_size=10)
+chain.configure("db_write", queue_size=20)   # bump just the buffer; default queue type
 
 # Error handler
 chain.set_error_handler(on_error)
@@ -534,12 +536,14 @@ Return positive to add workers, negative to remove, `0` for no change.
 
 ## Error Handling
 
-Errors and drops are reported to a single pipeline-level **error handler** as **typed events**. The handler decides what to do with each event by what it does with it:
+Errors and drops are reported to a single pipeline-level **error handler** as **typed events**. The handler is **observer-only** — it logs, accounts, or forwards events, but it does not control pipeline flow:
 
-- **Returns normally** → pipeline continues
-- **Raises** → pipeline aborts, exception propagates out of `run()`
+- **Returns normally** → pipeline continues; the failed item is dropped
+- **Raises** → the exception is logged to stderr; pipeline still continues; the failed item stays dropped
 
-Two layers, in order:
+This means a buggy handler (a logger that throws, a metric backend that's down) cannot abort your pipeline. To stop a run based on what the handler observes, call `chain.stop()` from outside — see [Aborting from inside the handler](#aborting-from-inside-the-handler) below.
+
+Two layers of error handling, in order:
 
 1. **Inside the transformer** (preferred). Catch and handle there: retry, return a sentinel value, drop silently. Most error logic should live here because the transformer has full context.
 2. **Pipeline error handler** (last resort). Whatever escapes the transformer (or comes from the source / framework decisions like `Dropped`) is routed here.
@@ -580,10 +584,9 @@ async def on_error(event):
     match event:
         case TransformerError(item, exc, stage):
             log.error("stage %s failed on %r: %s", stage, item, exc)
-            # returning continues the pipeline
         case SourceError(exc):
             log.critical("source failed: %s", exc)
-            raise           # aborts the pipeline
+            # source is exhausted; pipeline drains naturally
         case Dropped(item, stage, reason):
             log.warn("dropped %r at %s (%s)", item, stage, reason.name)
 
@@ -597,27 +600,33 @@ await chain.run(items)
 | Event | Default |
 |---|---|
 | `TransformerError` | Logged to stderr, pipeline continues |
-| `SourceError` | Re-raised — fatal |
+| `SourceError` | Logged to stderr, pipeline drains (source is treated as exhausted) |
 | `Dropped` | Silent continue |
 
 Set a handler whenever you need different behavior for any of these.
 
-### Producer error policy is a handler choice
+### Aborting from inside the handler
 
-The handler decides whether a source error is fatal or not. To abort, raise from the handler. To drain gracefully, log and return:
+The handler cannot abort the pipeline directly — raising just gets logged. To stop a run based on what the handler observes (e.g. "too many errors"), track state and call `chain.stop()` from the task driving the run:
 
 ```python
-# Policy: abort on source error (default behavior)
-case SourceError(exc):
-    raise
+errors = 0
 
-# Policy: log and drain on source error
-case SourceError(exc):
-    log.error("source: %s", exc)
-    # return without raising → source treated as exhausted; chain drains normally
+async def on_error(event):
+    nonlocal errors
+    if isinstance(event, TransformerError):
+        errors += 1
+
+run_task = asyncio.create_task(chain.run(items))
+while not run_task.done():
+    if errors > 100:
+        await chain.stop()
+        break
+    await asyncio.sleep(0.5)
+await run_task
 ```
 
-No separate config flag — write the handler that matches your policy.
+This separates "observe errors" (handler) from "decide to stop" (caller).
 
 ---
 
@@ -795,10 +804,10 @@ Exiting the `async with chain.push() as h:` block automatically calls `h.complet
 
 | Symbol | Kind | Purpose |
 |---|---|---|
-| `flow(*stages, on_error=None, default_scaling=None, default_queue=None)` | function | Construct a flow from a sequence of stages. Optional kwargs are shorthand for `set_error_handler` / `configure_default` |
+| `flow(*stages, on_error=None, default_scaling=None, default_queue=None, default_queue_size=None)` | function | Construct a flow from a sequence of stages. Optional kwargs are shorthand for `set_error_handler` / `configure_default` |
 | `router(classifier, **arms, default=...)` | function | Construct a router for branching |
 | `stage(fn, name=...)` | function | Override the auto-derived name of a stage |
-| `sync_stage(fn)` *(planned)* | function | Wrap a sync function with `asyncio.to_thread` so it can be used as an async stage |
+| `sync_stage(fn)` | function | Wrap a sync function with `asyncio.to_thread` so it can be used as an async stage |
 
 ### Activating a flow
 
@@ -818,8 +827,8 @@ Exiting the `async with chain.push() as h:` block automatically calls `h.complet
 
 | Method | Purpose |
 |---|---|
-| `flow.configure(name, scaling=..., queue=...)` | Per-stage tuning |
-| `flow.configure_default(scaling=..., queue=...)` | Pipeline-wide defaults |
+| `flow.configure(name, scaling=..., queue=..., queue_size=...)` | Per-stage tuning. `queue=` is a queue factory (`fifo_queue`, `priority_queue`, …); `queue_size=` is the queue's `maxsize`. Either or both may be set independently. |
+| `flow.configure_default(scaling=..., queue=..., queue_size=...)` | Pipeline-wide defaults; same kwargs as `configure()` |
 | `flow.set_error_handler(handler)` | Set the error sink for uncaught transformer exceptions |
 | `flow.dump(mode=...)` | Inspect the flow. `mode="structure"` renders the pipeline layout; `mode="stats"` renders live runtime stats |
 
@@ -853,7 +862,7 @@ Promises the framework makes to the user. If any of these are violated, it's a b
 
 ### Termination
 - **`chain.run(source)` returns naturally** when the source generator completes and the pipeline finishes draining.
-- **`chain.run(source)` re-raises** any exception that escapes the source (subject to the error handler — see [Error Handling](#error-handling)).
+- **`chain.run(source)` does not re-raise source exceptions.** A source-generator failure is delivered to the error handler as a `SourceError` event; the pipeline drains and `run()` returns normally. To abort on source failure, call `chain.stop()` from outside (see [Error Handling](#error-handling)).
 - **`chain.stop()` returns** only after every worker has exited and every per-worker resource has been released.
 - **`chain.drain()` returns** only after the pipeline is fully drained — no items in flight, all workers idle/exited.
 
