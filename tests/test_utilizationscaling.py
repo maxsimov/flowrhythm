@@ -1,11 +1,11 @@
 import pytest
 
-from flowrhythm._scaling import StageStats
+from flowrhythm._scaling import StageSnapshot
 from flowrhythm._utilizationscaling import UtilizationScaling
 
 
 def make_stats(busy_workers, idle_workers, **kwargs):
-    return StageStats(
+    return StageSnapshot(
         stage_name=kwargs.get("stage_name", "test"),
         busy_workers=busy_workers,
         idle_workers=idle_workers,
@@ -54,15 +54,15 @@ async def test_scaling_up_and_down_with_cooldown(fake_monotonic):
         dampening=1.0,
     )
     stats = make_stats(3, 0)  # Utilization = 1.0, can add 1 worker (max is 4)
-    assert await scaling.on_enqueue(stats) == 1
-    assert await scaling.on_enqueue(stats) == 0  # Cooldown not expired
+    assert scaling.on_enqueue(stats) == 1
+    assert scaling.on_enqueue(stats) == 0  # Cooldown not expired
     fake_monotonic.advance(5.1)
-    assert await scaling.on_enqueue(stats) == 1
+    assert scaling.on_enqueue(stats) == 1
 
     stats = make_stats(0, 3)  # Utilization = 0.0, can remove 1 worker (min is 2)
     fake_monotonic.advance(5.1)
-    assert await scaling.on_dequeue(stats) == -1
-    assert await scaling.on_dequeue(stats) == 0  # Cooldown not expired
+    assert scaling.on_dequeue(stats) == -1
+    assert scaling.on_dequeue(stats) == 0  # Cooldown not expired
 
 
 @pytest.mark.asyncio
@@ -76,8 +76,8 @@ async def test_scaling_no_action_between_thresholds():
         cooldown_seconds=0.0,
     )
     stats = make_stats(1, 1)  # Utilization = 0.5, between thresholds
-    assert await scaling.on_enqueue(stats) == 0
-    assert await scaling.on_dequeue(stats) == 0
+    assert scaling.on_enqueue(stats) == 0
+    assert scaling.on_dequeue(stats) == 0
 
 
 @pytest.mark.asyncio
@@ -92,10 +92,10 @@ async def test_scaling_limits(fake_monotonic):
         dampening=1.0,
     )
     stats = make_stats(2, 0)  # Already at max_workers
-    assert await scaling.on_enqueue(stats) == 0
+    assert scaling.on_enqueue(stats) == 0
 
     stats = make_stats(0, 1)  # Already at min_workers
-    assert await scaling.on_dequeue(stats) == 0 or await scaling.on_dequeue(stats) == -1
+    assert scaling.on_dequeue(stats) == 0 or scaling.on_dequeue(stats) == -1
 
 
 @pytest.mark.asyncio
@@ -110,10 +110,10 @@ async def test_sampling_period_skips_scaling(fake_monotonic):
         cooldown_seconds=0.0,
     )
     stats = make_stats(2, 0)  # Under max_workers
-    assert await scaling.on_enqueue(stats) == 1
-    assert await scaling.on_enqueue(stats) == 0
+    assert scaling.on_enqueue(stats) == 1
+    assert scaling.on_enqueue(stats) == 0
     fake_monotonic.advance(11.0)
-    assert await scaling.on_enqueue(stats) == 1
+    assert scaling.on_enqueue(stats) == 1
 
 
 @pytest.mark.asyncio
@@ -128,9 +128,9 @@ async def test_sampling_events_skips_scaling(fake_monotonic):
         cooldown_seconds=0.0,
     )
     stats = make_stats(2, 0)  # Under max_workers
-    assert await scaling.on_enqueue(stats) == 0
-    assert await scaling.on_enqueue(stats) == 0
-    assert await scaling.on_enqueue(stats) == 1  # 3rd event
+    assert scaling.on_enqueue(stats) == 0
+    assert scaling.on_enqueue(stats) == 0
+    assert scaling.on_enqueue(stats) == 1  # 3rd event
 
 
 @pytest.mark.asyncio
@@ -145,7 +145,7 @@ async def test_dampening_zero_results_minimum_scale(fake_monotonic):
         cooldown_seconds=0.0,
     )
     stats = make_stats(4, 0)  # Under max_workers
-    assert await scaling.on_enqueue(stats) == 1
+    assert scaling.on_enqueue(stats) == 1
 
 
 @pytest.mark.asyncio
@@ -159,6 +159,6 @@ async def test_exact_thresholds_do_not_scale(fake_monotonic):
         cooldown_seconds=0.0,
     )
     stats = make_stats(4, 1)  # Utilization = 0.8 (upper threshold)
-    assert await scaling.on_enqueue(stats) == 0
+    assert scaling.on_enqueue(stats) == 0
     stats = make_stats(1, 1)  # Utilization = 0.5 (lower threshold)
-    assert await scaling.on_dequeue(stats) == 0
+    assert scaling.on_dequeue(stats) == 0

@@ -14,7 +14,7 @@ from typing import Optional, Protocol
 
 
 @dataclass
-class StageStats:
+class StageSnapshot:
     stage_name: str
     busy_workers: int
     idle_workers: int
@@ -37,15 +37,21 @@ class StageStats:
 
 
 class ScalingStrategy(Protocol):
-    """Protocol for stage worker-pool sizing strategies."""
+    """Protocol for stage worker-pool sizing strategies.
+
+    All methods are **synchronous** by design. Scaling decisions are called
+    on every item event (potentially millions/sec); awaiting external
+    services here would block the hot path. If a strategy needs external
+    state, refresh it in a background task and read it synchronously here.
+    """
 
     def initial_workers(self) -> int:
         """Number of workers to spawn when the stage starts."""
 
-    async def on_enqueue(self, stats: StageStats) -> int:
+    def on_enqueue(self, stats: StageSnapshot) -> int:
         """Return delta to apply on item-enqueue events. Positive = add, negative = remove."""
 
-    async def on_dequeue(self, stats: StageStats) -> int:
+    def on_dequeue(self, stats: StageSnapshot) -> int:
         """Return delta to apply on item-dequeue events. Positive = add, negative = remove."""
 
 
@@ -66,8 +72,8 @@ class FixedScaling:
     def initial_workers(self) -> int:
         return self.workers
 
-    async def on_enqueue(self, stats: StageStats) -> int:
+    def on_enqueue(self, stats: StageSnapshot) -> int:
         return 0  # never scales
 
-    async def on_dequeue(self, stats: StageStats) -> int:
+    def on_dequeue(self, stats: StageSnapshot) -> int:
         return 0  # never scales

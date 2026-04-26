@@ -283,7 +283,7 @@ async def on_error(event):
 
 ### Scaling Strategy
 
-Decides how many workers a stage runs based on live `StageStats`. Built-in: `FixedScaling`, `UtilizationScaling`. Or implement the protocol yourself.
+Decides how many workers a stage runs based on live `StageSnapshot`. Built-in: `FixedScaling`, `UtilizationScaling`. Or implement the protocol yourself.
 
 ---
 
@@ -513,13 +513,16 @@ If both gates pass, the strategy reads `utilization = busy_workers / total_worke
 - **High-throughput stage** — set `sampling_events=100` or `sampling_period=1.0` to avoid overhead from per-item scaling decisions
 
 ### Custom strategy
-Implement the protocol:
+Implement the protocol — note the methods are **synchronous**:
 ```python
 class MyStrategy:
-    async def on_enqueue(self, stats: StageStats) -> int: ...
-    async def on_dequeue(self, stats: StageStats) -> int: ...
+    def initial_workers(self) -> int: ...
+    def on_enqueue(self, stats: StageSnapshot) -> int: ...
+    def on_dequeue(self, stats: StageSnapshot) -> int: ...
 ```
 Return positive to add workers, negative to remove, `0` for no change.
+
+> **Strategies must be sync.** Scaling decisions are called on every item event (potentially millions/sec); awaiting external services here would block the hot path. If you need external state for a decision, refresh it in a background task and read it synchronously here.
 
 ### Worker rules
 - **The source** (when passed to `run()`) is consumed by exactly one task — async generators cannot be safely consumed concurrently
@@ -831,7 +834,7 @@ Exiting the `async with chain.push() as h:` block automatically calls `h.complet
 | `TransformerError`, `SourceError`, `Dropped` | dataclasses | Event types passed to the error handler |
 | `DropReason` | enum | Reasons items get dropped (`UPSTREAM_TERMINATED`, `ROUTER_MISS`) |
 | `FixedScaling`, `UtilizationScaling` | classes | Built-in scaling strategies |
-| `ScalingStrategy`, `StageStats` | protocol / dataclass | For implementing custom strategies |
+| `ScalingStrategy`, `StageSnapshot` | protocol / dataclass | For implementing custom strategies |
 | `fifo_queue`, `lifo_queue`, `priority_queue` | functions | Queue factories |
 
 ---

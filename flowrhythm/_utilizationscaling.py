@@ -1,7 +1,7 @@
 import time
 from typing import Optional
 
-from ._scaling import StageStats
+from ._scaling import StageSnapshot
 
 
 class UtilizationScaling:
@@ -58,13 +58,13 @@ class UtilizationScaling:
     def _record_scale(self):
         self._last_scaled_at = time.monotonic()
 
-    async def on_enqueue(self, stats: StageStats) -> int:
-        return await self._scale(stats)
+    def on_enqueue(self, stats: StageSnapshot) -> int:
+        return self._scale(stats)
 
-    async def on_dequeue(self, stats: StageStats) -> int:
-        return await self._scale(stats)
+    def on_dequeue(self, stats: StageSnapshot) -> int:
+        return self._scale(stats)
 
-    async def _scale(self, stats: StageStats) -> int:
+    def _scale(self, stats: StageSnapshot) -> int:
         # Sampling
         if (
             self.sampling_events is not None or self.sampling_period is not None

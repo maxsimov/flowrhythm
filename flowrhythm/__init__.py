@@ -16,7 +16,7 @@ from ._queue import (
 from ._scaling import (
     FixedScaling,
     ScalingStrategy,
-    StageStats,
+    StageSnapshot,
 )
 from ._utilizationscaling import UtilizationScaling
 
@@ -26,7 +26,7 @@ __all__ = [
     "FixedScaling",
     "Flow",
     "ScalingStrategy",
-    "StageStats",
+    "StageSnapshot",
     "UtilizationScaling",
     "fifo_queue",
     "flow",

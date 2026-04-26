@@ -273,22 +273,160 @@ The abort cascade (`Flow.stop()`):
 - All workers awaiting `get()` unblock and raise; in-flight workers complete current item, then `__aexit__` runs on their CMs (resources always released)
 - Returns when no workers are alive
 
-#### Worker states (useful for `dump()` and debugging)
-At any moment, a worker is in one of three states:
-
-| State | What the worker is doing | Affected by input-queue `shutdown()`? |
-|---|---|---|
-| **`waiting_input`** | Blocked on `my_queue.get()` | Yes — graceful shutdown returns remaining items first, then raises `QueueShutDown` once empty; immediate shutdown raises right away |
-| **`processing`** | Awaiting the user's transformer (`await fn(item)`) | No — current item always completes |
-| **`waiting_output`** | Blocked on `next_queue.put(result)` | No — next queue isn't shut down yet (this worker is still alive) |
-
-`dump(mode="stats")` should expose per-stage counts of workers in each state, plus the queue's open/shut-down status, so users can diagnose stalls (e.g., "8 workers all `waiting_output`" → downstream is the bottleneck).
-
 #### Race-free against scaling
 - Workers exit independently — no per-stage worker counter for the cascade to track (the per-stage tracker only watches "alive count → 0")
 - Scaling strategy is told "input shutting down" so it stops scaling up (down-scaling is fine; workers exit anyway)
 - A worker spawned mid-drain immediately hits `get()` and either picks an in-flight item or exits cleanly — no hang, no leak
 - A worker mid-`put()` to a downstream queue is unaffected; downstream queue is shut down only after this stage finishes
+
+### Worker pool internals
+
+Each stage owns a worker pool. The runtime needs to:
+1. Know how many workers to run (driven by the scaling strategy)
+2. Spawn / retire workers as the strategy decides
+3. Cancel workers safely when needed (scale-to-zero, `Flow.stop()`)
+4. Distinguish workers that are safe to cancel from those that aren't
+5. Expose state for `dump(mode="stats")` and debugging
+
+#### Worker lifecycle states
+
+A worker passes through these states during its life:
+
+| # | State | What the worker is doing | Safe to cancel? | Why |
+|---|---|---|---|---|
+| 1 | **Spawning** | Task created, body not yet entered | Trivially safe (nothing to clean up) | — |
+| 2 | **Initializing CM** | `__aenter__` running (M3+) | **No** | Partial `__aenter__` does NOT trigger `__aexit__`; cancellation here leaks resources |
+| 3 | **`waiting_input`** | Blocked on `my_queue.get()` | **Yes** | No item in flight, no resource state mid-mutation |
+| 4 | **`processing`** | `await fn(item)` running | **No** | Cancellation = item loss + user transformer interrupted mid-call |
+| 5 | **`waiting_output`** | Blocked on `next_queue.put(result)` | **No** | Holds an undelivered result; cancellation = result loss |
+| 6 | **Tearing down CM** | `__aexit__` running | **No** | Interrupting cleanup defeats its purpose |
+
+Only state 3 (`waiting_input`) is safe to cancel. All other states must exit voluntarily or via `Flow.stop()` (which is the abort path; item loss accepted there).
+
+`dump(mode="stats")` exposes per-stage counts of workers in each state, plus the queue's open/shut-down status, so users can diagnose stalls (e.g., "8 workers all `waiting_output`" → downstream is the bottleneck).
+
+#### Worker tracking
+
+Per stage, two task sets:
+
+- `all_workers[i]: set[asyncio.Task]` — every alive worker task. Used by `Flow.stop()` to cancel everyone, and to compute `alive[i] = len(all_workers[i])`.
+- `idle_workers[i]: set[asyncio.Task]` — subset currently in state 3 (`waiting_input`). The only set targeted by routine cancellation.
+
+Workers self-register and self-unregister around their `await get()`:
+
+```python
+idle_workers[i].add(my_task)
+try:
+    item = await queues[i].get()
+except (asyncio.QueueShutDown, asyncio.CancelledError):
+    return  # clean exit
+finally:
+    idle_workers[i].discard(my_task)
+```
+
+The `add()` → `await get()` sequence has no `await` between them, so any `task.cancel()` arriving in that window fires at `get()` (the next await), which is correctly caught.
+
+#### Pool sizing: `target` vs `alive`
+
+Two-counter declarative design — `target` is what the system should look like, `alive` is what it currently looks like:
+
+```python
+target[i] = strategy.initial_workers()
+alive[i]  = len(all_workers[i])  # derived
+```
+
+When `strategy.on_enqueue()` / `on_dequeue()` returns a delta:
+
+```python
+target[i] = max(0, target[i] + delta)
+diff = target[i] - alive[i]
+if diff > 0:
+    for _ in range(diff):
+        spawn worker; alive grows when task added to all_workers[i]
+# if diff < 0: see retirement mechanisms below
+```
+
+#### Retirement mechanisms (two paths)
+
+Two ways a worker can voluntarily exit when `target[i] < alive[i]`:
+
+| Path | When used | How |
+|---|---|---|
+| **Polling** | `target[i] > 0` (partial scale-down) | At top of worker loop, check `if alive[i] > target[i]: return`. Simple, no task-tracking required. Idle workers retire on their next item or shutdown. |
+| **Targeted cancel** | `target[i] == 0` (scale-to-zero) | Pick a task from `idle_workers[i]` and call `.cancel()`. Required because pure polling can't wake idle workers blocked on `get()` with no incoming items. |
+
+The polling check happens **before** the worker registers itself as idle, so a fast scale-down doesn't have to cancel anything — it lands on the next loop iteration.
+
+#### Why this design is safe under all paths
+
+| Scenario | Behavior |
+|---|---|
+| Polling fires at top of loop | Worker decrements `alive`, returns. Clean. |
+| Worker in `idle_workers[i]` + targeted cancel | `CancelledError` at `get()`, caught, clean exit |
+| Worker just left `idle_workers[i]` (got an item) + targeted cancel | Not in set → not cancelled. Polling on next iteration catches it. |
+| Worker in CM init (state 2) + retire signal | Not in `idle_workers[i]` → not cancelled. Init completes; polling retires it on first loop iteration. |
+| `Flow.stop()` (abort) | `shutdown(immediate=True)` on every queue + cancel all `all_workers[i]`. Item loss is acceptable in abort path. |
+
+#### Asyncio safety notes
+
+- `asyncio` is single-threaded cooperative — plain `int` and `set` operations are safe between `await` points.
+- The polling check (`if alive[i] > target[i]: alive[i] -= 1; return`) has no `await` between read and write — no interleaving possible.
+- The `set.add()` → `await get()` window has no `await` — cancellation can't fire in the gap, only at the await.
+- This safety relies on the runtime functions (the polling check, the add/discard around get(), the strategy-call + counter-update window) staying synchronous. The `ScalingStrategy` Protocol declares its methods as `def`, not `async def`, specifically to preserve this invariant.
+
+#### Strategy contract: synchronous by design
+
+`ScalingStrategy.on_enqueue()` / `on_dequeue()` are **synchronous**. Built-in strategies (`FixedScaling`, `UtilizationScaling`) are sync; custom strategies must also be sync. Reasons:
+
+- **Hot-path performance** — strategies are called on every item event, potentially millions of calls/sec. async dispatch overhead is wasteful.
+- **Race-condition safety** — sync strategies cannot suspend, so the strategy-call + counter-update sequence stays atomic. No locks needed; no double-scaling races.
+- **Forces correct design** — putting `await something()` on the hot path is an anti-pattern. If a strategy needs external state (config, remote metric), refresh it in a background task and read the cached value sync here.
+
+If a future need genuinely requires the strategy to invoke async work, that work belongs in a separate background task that updates state the strategy can read. Don't change the protocol to `async`.
+
+#### Run completion: state-driven, not task-driven
+
+`Flow.run()` cannot use `asyncio.gather` or `asyncio.TaskGroup` to wait for completion. Workers come and go dynamically (UtilizationScaling spawns mid-run); a fixed task list doesn't fit. Instead, completion is detected from **runtime state**:
+
+```python
+done_event = asyncio.Event()
+
+def check_done():
+    if source_finished and all(a == 0 for a in alive):
+        done_event.set()
+
+# Spawn fire-and-forget; no list to wait on
+for stage_idx in range(n):
+    for _ in range(target[stage_idx]):
+        asyncio.create_task(worker_task(stage_idx))
+asyncio.create_task(source_task())
+
+await done_event.wait()
+```
+
+Each worker (and the source task) calls `check_done()` in its `finally` block after decrementing its `alive` counter. The first invocation that finds the done condition true sets the event.
+
+Exceptions are captured manually — task bodies are wrapped in `try / except BaseException`:
+
+```python
+async def worker_task(stage_idx):
+    nonlocal first_exception
+    try:
+        # ... worker loop ...
+    except BaseException as e:
+        if first_exception is None:
+            first_exception = e
+        done_event.set()   # fast-fail: stop waiting
+        raise              # let the task's exception still appear in asyncio's logs
+    finally:
+        alive[stage_idx] -= 1
+        check_done()
+```
+
+After `done_event.wait()` returns, `_start_and_join` re-raises `first_exception` if set. This:
+- Keeps task management fully dynamic (no list, no group, no gather)
+- Makes the "we're done" condition a property of state — easy to reason about and to expose via `dump(stats)`
+- Lets `Flow.stop()` (M5) work the same way: it triggers `shutdown(immediate=True)` on every queue, then targeted-cancels every task in `all_workers[i]`; workers exit, alive counters drop to 0, `done_event` fires, run returns.
 
 ### Component class diagram
 
@@ -347,7 +485,7 @@ classDiagram
     class FixedScaling
     class UtilizationScaling
 
-    class StageStats {
+    class StageSnapshot {
         +stage_name
         +busy_workers
         +idle_workers
@@ -365,7 +503,7 @@ classDiagram
     Flow --> ScalingStrategy
     ScalingStrategy <|.. FixedScaling
     ScalingStrategy <|.. UtilizationScaling
-    ScalingStrategy <.. StageStats
+    ScalingStrategy <.. StageSnapshot
 ```
 
 ---

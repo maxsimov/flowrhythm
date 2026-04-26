@@ -94,10 +94,10 @@ Coverage: 95% on `_flow.py`, 96% overall. 61 tests pass in 0.05s.
 
 ### M2c — UtilizationScaling integration
 
-Goal: `UtilizationScaling` (already implemented as a strategy) drives the worker pool dynamically based on `StageStats`.
+Goal: `UtilizationScaling` (already implemented as a strategy) drives the worker pool dynamically based on `StageSnapshot`.
 
-- [ ] Wire `ScalingStrategy.on_enqueue` and `on_dequeue` into the runtime — invoke after every enqueue/dequeue with the current `StageStats`; spawn or stop workers per the returned delta
-- [ ] Build `StageStats` snapshot from worker tracker (busy/idle counts, queue length, timestamps)
+- [ ] Wire `ScalingStrategy.on_enqueue` and `on_dequeue` into the runtime — invoke after every enqueue/dequeue with the current `StageSnapshot`; spawn or stop workers per the returned delta
+- [ ] Build `StageSnapshot` snapshot from worker tracker (busy/idle counts, queue length, timestamps)
 - [ ] Test: `UtilizationScaling(min_workers=1, max_workers=8)` adds workers under sustained load and removes them when idle
 - [ ] Test: `min_workers=0` (scale-to-zero) — stage starts with 0, scales up on first item, scales back down when idle
 - [ ] Test: cooldown prevents flapping under bursty load
