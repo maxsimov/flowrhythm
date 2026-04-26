@@ -195,13 +195,56 @@ Detection: if `inspect.isasyncgen(source)` (instantiated generator), raise. If `
 - Two layers: handle inside transformer (preferred), pipeline error handler (last resort)
 - Built-in exceptions only — no custom hierarchy
 - Error handler receives **typed events**, not raw `(item, exception)` tuples
-- Handler behavior decides policy:
-  - Returns normally → pipeline continues
-  - Raises → pipeline aborts, exception propagates out of `run()`
-- Default behavior when no handler is set:
+- **Handler is observer-only** (see "Error handler is observer-only" below): it logs / accounts / forwards but does not control pipeline flow. Raising from the handler is treated as a handler bug — the exception is logged to stderr; the failed item stays dropped (it was already not delivered downstream); the pipeline continues. To stop a run, call `Flow.stop()` from outside.
+- Default behavior when no handler is set (`default_handler` in `_errors.py`):
   - `TransformerError` → log to stderr, continue
-  - `SourceError` → re-raise (fatal)
+  - `SourceError` → log to stderr, continue (source is exhausted; pipeline drains)
   - `Dropped` → silent continue
+
+#### Error handler is observer-only
+
+The error handler is **purely an observer** — it can log errors, increment metrics, push failed items to a dead-letter queue, etc. It does NOT control flow:
+
+- **Handler returns normally** → pipeline continues; failed item is dropped
+- **Handler raises** → exception is logged to stderr; pipeline still continues; failed item stays dropped
+
+Why this design (we considered the alternative where handler-raise = abort and rejected it):
+
+| Use case | Frequency | Observer-only fits? | Raise-aborts fits? |
+|---|---|---|---|
+| Log errors to stderr / file | very common | ✓ | ⚠ logger glitch aborts the whole run |
+| Count errors / push metrics | very common | ✓ | ⚠ metric backend glitch aborts |
+| Dead-letter queue (push failed items elsewhere) | common | ✓ | ⚠ DLQ outage aborts |
+| Threshold-based abort ("too many errors → stop") | rare | needs `Flow.stop()` from outside | ✓ |
+
+Most real handlers (90%+) are observers; their bugs should not have outsized blast radius. The threshold-based-abort case is rare and has a clean external pattern using `Flow.stop()`. Conflating "handler did something unexpected" with "user wants to abort" makes handler bugs catastrophic.
+
+#### Symmetry argument
+
+When a transformer raises, the failed item is **redirected** from its downstream queue to the error handler — the handler is effectively the sink for failed items. By symmetry, when the handler itself fails, the item is already AT the sink and has nowhere to go: drop it. Aborting the entire pipeline because a sink had a glitch would be wildly disproportionate.
+
+#### Stopping a run from inside the handler
+
+If a user genuinely needs the threshold-abort pattern, the clean approach is to track state outside the handler and call `Flow.stop()` (M5):
+
+```python
+errors = 0
+
+async def on_error(event):
+    nonlocal errors
+    errors += 1
+
+# In main code, alongside the run task:
+run_task = asyncio.create_task(chain.run(items))
+while not run_task.done():
+    if errors > 100:
+        await chain.stop()
+        break
+    await asyncio.sleep(0.5)
+await run_task
+```
+
+This separates "observe errors" (handler) from "decide to stop" (caller of `Flow.stop()`).
 
 #### Event types (initial set)
 ```python

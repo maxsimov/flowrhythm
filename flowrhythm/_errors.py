@@ -69,8 +69,13 @@ ErrorEvent = TransformerError | SourceError | Dropped
 async def default_handler(event: ErrorEvent) -> None:
     """Default error handler used when the user hasn't set one.
 
+    The handler is an observer: it logs visible errors to stderr and
+    silently accepts drops. The pipeline always continues — handler-raise
+    does NOT abort. To stop a run, call `Flow.stop()` externally.
+    See DESIGN.md "Error handler is observer-only".
+
     - `TransformerError` → log to stderr, continue
-    - `SourceError` → re-raise (framework converts to abort)
+    - `SourceError` → log to stderr, continue (source is exhausted; pipeline drains)
     - `Dropped` → silent
 
     Users override this with `set_error_handler` or the `on_error=` kwarg.
@@ -83,6 +88,9 @@ async def default_handler(event: ErrorEvent) -> None:
                 file=sys.stderr,
             )
         case SourceError(exception=exc):
-            raise exc
+            print(
+                f"[flowrhythm] source failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
         case Dropped():
             pass

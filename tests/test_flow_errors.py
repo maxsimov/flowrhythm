@@ -80,49 +80,45 @@ async def test_handler_returns_continues_pipeline():
 
 
 # ---------------------------------------------------------------------------
-# Handler raises → run() re-raises with the handler's exception
+# Handler raise → logged, pipeline continues (observer-only contract).
+# See DESIGN.md "Error handler is observer-only".
 # ---------------------------------------------------------------------------
 
 
-async def test_handler_raise_aborts_run_with_handler_exception():
-    async def boom(x):
-        raise RuntimeError("transformer failed")
+async def test_handler_raise_does_not_abort_pipeline(capsys):
+    """Handler is an observer; raising is a handler bug, not a flow-control
+    signal. The exception is logged; the pipeline continues; subsequent
+    items are still processed."""
+    received = []
 
-    async def sink(x):
-        pass
+    async def maybe_boom(x):
+        if x == 1:
+            raise RuntimeError("transformer failed on x==1")
+        return x * 10
+
+    async def collect(x):
+        received.append(x)
 
     class HandlerAbort(Exception):
         pass
 
     async def on_error(event):
-        raise HandlerAbort("decided to abort")
+        raise HandlerAbort("handler bug — would have wanted to abort")
 
     async def items():
-        for i in range(10):
+        for i in range(5):
             yield i
 
-    chain = flow(boom, sink, on_error=on_error)
-    with pytest.raises(HandlerAbort, match="decided to abort"):
-        await chain.run(items)
+    chain = flow(maybe_boom, collect, on_error=on_error)
+    # Pipeline runs to completion; HandlerAbort does NOT propagate
+    await chain.run(items)
 
-
-async def test_handler_can_re_raise_original_exception():
-    async def boom(x):
-        raise RuntimeError("original")
-
-    async def sink(x):
-        pass
-
-    async def on_error(event):
-        if isinstance(event, TransformerError):
-            raise event.exception
-
-    async def items():
-        yield 1
-
-    chain = flow(boom, sink, on_error=on_error)
-    with pytest.raises(RuntimeError, match="original"):
-        await chain.run(items)
+    # Failed item dropped (the one where transformer raised); others delivered
+    assert sorted(received) == [0, 20, 30, 40]
+    # Handler's exception was logged to stderr
+    captured = capsys.readouterr()
+    assert "HandlerAbort" in captured.err
+    assert "handler bug" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -184,17 +180,30 @@ async def test_default_handler_logs_transformer_error_and_continues(capsys):
     assert sorted(received) == [0, 2, 3, 4]
 
 
-async def test_default_handler_re_raises_source_error():
+async def test_default_handler_logs_source_error_and_drains(capsys):
+    """Default handler is an observer: source errors are logged but do not
+    abort. The source is treated as exhausted; the pipeline drains normally."""
+    received = []
+
     async def fn(x):
         return x
 
-    async def items():
-        yield 0
-        raise RuntimeError("source died")
+    async def collect(x):
+        received.append(x)
 
-    chain = flow(fn)  # default handler re-raises SourceError
-    with pytest.raises(RuntimeError, match="source died"):
-        await chain.run(items)
+    async def items():
+        yield 100
+        yield 200
+        raise RuntimeError("source died after 2 items")
+
+    chain = flow(fn, collect)  # default handler — observer-only
+    await chain.run(items)  # does NOT raise
+
+    captured = capsys.readouterr()
+    assert "source failed" in captured.err
+    assert "source died" in captured.err
+    # Items already in flight finished
+    assert sorted(received) == [100, 200]
 
 
 # ---------------------------------------------------------------------------

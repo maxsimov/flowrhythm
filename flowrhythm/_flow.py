@@ -17,6 +17,7 @@ DESIGN.md "Worker pool internals".
 import asyncio
 import functools
 import inspect
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncContextManager, AsyncGenerator, Awaitable, Callable
@@ -259,12 +260,11 @@ class _FlowRun:
                 )
             )
 
-        # Error handling
+        # Error handling — observer pattern: handler is called with typed
+        # events. If the handler raises, we log and continue (handler is
+        # not a flow-control mechanism; use Flow.stop() to abort externally).
+        # See DESIGN.md "Error handler is observer-only".
         self._handler: ErrorHandler = flow._error_handler
-        # First exception captured by _abort (handler-raise or framework
-        # bug). Stored so execute() can re-raise from run() after the
-        # pipeline drains.
-        self._abort_exception: BaseException | None = None
 
         # Run-completion state
         self._source_finished = False
@@ -306,29 +306,24 @@ class _FlowRun:
     async def _handle_error(self, event: ErrorEvent) -> None:
         """Call the user's error handler with `event`.
 
-        If the handler raises, capture the exception and trigger an abort.
+        The handler is an **observer**, not a controller — see DESIGN.md
+        "Error handler is observer-only". If the handler raises, the
+        exception is logged to stderr; the failed item is dropped (already
+        was, since it was never put downstream); the pipeline continues.
+        To stop the run, use `Flow.stop()` from outside the handler.
+
         Catches `Exception` only (NOT `BaseException`) so cooperative
         cancellation propagates — see DESIGN.md "Asyncio safety notes".
         """
         try:
             await self._handler(event)
         except Exception as exc:
-            self._abort(exc)
-
-    def _abort(self, exc: BaseException) -> None:
-        """Initiate immediate-abort cascade with `exc` as the cause.
-
-        Captures the first exception (subsequent calls are no-ops). Calls
-        `shutdown(immediate=True)` on every queue so workers awaiting
-        `get()` unblock with `QueueShutDown` and exit. `execute()` re-raises
-        the captured exception after `_done_event` fires.
-        """
-        if self._abort_exception is not None:
-            return
-        self._abort_exception = exc
-        for s in self._stages:
-            s.queue.shutdown(immediate=True)  # type: ignore[attr-defined]
-            s.input_drained = True
+            print(
+                f"[flowrhythm] error handler raised {type(exc).__name__}: {exc} "
+                f"while processing {type(event).__name__}; "
+                f"item dropped, pipeline continues",
+                file=sys.stderr,
+            )
 
     def _maybe_cascade(self, stage_idx: int) -> None:
         """If stage `stage_idx` is fully drained, shut down downstream and recurse.
@@ -473,10 +468,6 @@ class _FlowRun:
         # check_done can be true immediately. Source still sets the flag.
         self._check_done()
         await self._done_event.wait()
-        # If the error handler raised (or any other framework path called
-        # _abort), surface that exception out of run().
-        if self._abort_exception is not None:
-            raise self._abort_exception
 
 
 def flow(
