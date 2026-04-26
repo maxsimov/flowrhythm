@@ -406,27 +406,21 @@ await done_event.wait()
 
 Each worker (and the source task) calls `check_done()` in its `finally` block after decrementing its `alive` counter. The first invocation that finds the done condition true sets the event.
 
-Exceptions are captured manually — task bodies are wrapped in `try / except BaseException`:
-
-```python
-async def worker_task(stage_idx):
-    nonlocal first_exception
-    try:
-        # ... worker loop ...
-    except BaseException as e:
-        if first_exception is None:
-            first_exception = e
-        done_event.set()   # fast-fail: stop waiting
-        raise              # let the task's exception still appear in asyncio's logs
-    finally:
-        alive[stage_idx] -= 1
-        check_done()
-```
-
-After `done_event.wait()` returns, `_start_and_join` re-raises `first_exception` if set. This:
+This:
 - Keeps task management fully dynamic (no list, no group, no gather)
 - Makes the "we're done" condition a property of state — easy to reason about and to expose via `dump(stats)`
 - Lets `Flow.stop()` (M5) work the same way: it triggers `shutdown(immediate=True)` on every queue, then targeted-cancels every task in `all_workers[i]`; workers exit, alive counters drop to 0, `done_event` fires, run returns.
+
+#### Exception handling within tasks (deferred to M4)
+
+Workers and the source task may raise. Python guarantees `finally` blocks run on exception, so cleanup (alive decrement, queue shutdown) happens regardless. The pipeline drains naturally — `run()` does not deadlock.
+
+What about surfacing the exception to the caller of `run()`?
+
+- **M2c (current):** uncaught exceptions in tasks are logged by asyncio's default unhandled-exception handler. `run()` returns normally when state reaches "done." The user sees a stderr log but no Python exception from `run()`. This is incomplete UX but does not corrupt state.
+- **M4 (next):** the runtime wraps every transformer call in `try/except`, routes exceptions to the typed-events error handler (`TransformerError`, `SourceError`), and the handler decides policy (raise = abort and re-raise from `run()`, return = continue). M4 supersedes the M2c gap.
+
+Adding ad-hoc exception capture in M2c would just be replaced by M4's machinery. The minimal M2c design — no exception cell, no fail-fast — is intentional.
 
 ### Component class diagram
 

@@ -96,11 +96,25 @@ Coverage: 95% on `_flow.py`, 96% overall. 61 tests pass in 0.05s.
 
 Goal: `UtilizationScaling` (already implemented as a strategy) drives the worker pool dynamically based on `StageSnapshot`.
 
-- [ ] Wire `ScalingStrategy.on_enqueue` and `on_dequeue` into the runtime — invoke after every enqueue/dequeue with the current `StageSnapshot`; spawn or stop workers per the returned delta
-- [ ] Build `StageSnapshot` snapshot from worker tracker (busy/idle counts, queue length, timestamps)
-- [ ] Test: `UtilizationScaling(min_workers=1, max_workers=8)` adds workers under sustained load and removes them when idle
-- [ ] Test: `min_workers=0` (scale-to-zero) — stage starts with 0, scales up on first item, scales back down when idle
-- [ ] Test: cooldown prevents flapping under bursty load
+- [x] Extracted `_FlowRun` class — per-execution state and tasks live in their own object instead of closures inside `_start_and_join`. Sets up M5 (`Flow.stop()` calls `_FlowRun.abort()`), M6 (`PushHandle` holds a `_FlowRun`), M9/M10 (`dump()` reads from it)
+- [x] Wired `strategy.on_enqueue()` after every put (source's put to stage 0; worker's put to stage i+1) and `strategy.on_dequeue()` after every get (right after the worker takes an item, before processing)
+- [x] Per-stage `_make_snapshot()` builds `StageSnapshot` from runtime tracking (busy/idle/queue_length). Timestamps are placeholder zeros — M9/M10 will fill them when `dump(stats)` lands.
+- [x] Two-counter design (`_target` / `_alive`) per DESIGN.md "Worker pool internals"
+- [x] `_spawn_worker()` is the sole source of `_alive` increments; `_alive` starts at 0 and is brought up to `_target` by the initial spawn loop
+- [x] Polling retirement check at top of worker loop (handles `target > 0` case)
+- [x] State-driven completion via `_done_event` (no `gather`/`TaskGroup`); fired when `_source_finished and all(_alive == 0)`
+- [x] `_input_drained[i]` flag distinguishes drain-cascade from voluntary retirement (avoids spurious downstream shutdown when workers retire mid-run)
+- [x] `_all_workers[i]` and `_idle_workers[i]` task sets per stage — placeholders for M5 abort and the scale-to-zero targeted-cancel
+- [x] Test: `UtilizationScaling(min_workers=1, max_workers=8)` grows worker count under load (max_in_flight ≥ 4)
+- [x] Regression test: `FixedScaling(workers=4)` still gives exactly 4 concurrent workers after the refactor
+- [x] Test: no items lost or duplicated under dynamic scaling
+
+Deferred to M2d / later:
+- Targeted cancellation of idle workers (needed for true scale-to-zero with `min_workers=0`)
+- Cooldown / sampling integration tests for `UtilizationScaling` (the strategy is already covered by `test_utilizationscaling.py`; integration in the runtime is implicit since strategy decisions are sync)
+- Removing workers when load drops (polling handles it lazily, but a test demonstrating shrinkage would be nice)
+
+Coverage: 97% on `_flow.py`, 98% overall. 65 tests pass in 0.05s. `make lint` clean.
 
 ### M3 — CM factory transformers
 
