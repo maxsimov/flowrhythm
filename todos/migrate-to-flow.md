@@ -15,7 +15,7 @@ See `DESIGN.md` for the design that this implements.
 
 ### Public API surface
 
-- [ ] Implement `flow(*stages)` function returning a `Flow` instance
+- [ ] Implement `flow(*stages, on_error=None, default_scaling=None, default_queue=None)` function returning a `Flow` instance. Constructor kwargs are equivalent to `set_error_handler` / `configure_default(scaling=...)` / `configure_default(queue=...)` after construction.
 - [ ] Implement `router(classifier, **arms, default=None)` returning a `Router` instance
 - [ ] Implement `stage(fn, name=...)` wrapper for explicit naming
 - [ ] Implement `Last(value)` wrapper for transformer-initiated termination
@@ -86,6 +86,7 @@ See `DESIGN.md` for the design that this implements.
 ### Polish
 
 - [ ] Implement `sync_stage(fn)` helper that wraps with `asyncio.to_thread`
+- [ ] Add a "Troubleshooting" section to README based on real failure modes encountered during implementation and testing — common mistakes (sync code in stages, `flow(items())` instead of `flow(items)`, missing error handler), how to read `dump()` output, what to check when the pipeline stalls. Was deferred from `readme-rewrite.md` because writing this without a runtime to validate against is speculative.
 - [ ] Verify `make lint` passes (ruff)
 - [ ] Verify `make cov` shows reasonable coverage
 

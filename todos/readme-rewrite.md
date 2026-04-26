@@ -1,6 +1,6 @@
 # README rewrite
 
-**Status:** in-progress
+**Status:** implemented
 **Updated:** 2026-04-26
 
 ## Motivation
@@ -32,28 +32,28 @@ A first-time-reader audit of README.md surfaced 18 items that confuse, repeat, o
 
 ### Bugs in examples
 
-- [ ] **Naming example uses `flow(reader, ...)` where `reader` is an async generator** — would raise `TypeError` per current design rules. Fix the example.
+- [x] **Naming example uses `flow(reader, ...)` where `reader` is an async generator** — fixed by removing `reader` from the `flow()` args; the example now shows just `flow(stage(normalize, name="parse"), db_write)`.
 
 ### Vocabulary and pacing
 
-- [ ] **Heavy jargon appears before basic concepts** — "graph fragment", "call-shape", "type-level separation", "namespaced sub-stages" all show up before the user has built a working pipeline. Defer jargon to deeper sections.
+- [x] **Heavy jargon appears before basic concepts** — replaced framework-coined terms with plain English: "call-shape transformers" → "per-item transformers"; "graph fragments" → "sub-pipelines"; "auto-trigger" → "no source"; "namespaced stage names" → "stage names in the parent". Updated everywhere (Stages, Composing flows, Routing, Architecture diagram + match block, Public API table, lifecycle pointers). "Type-level separation" deferred — its whole subsection is on the chopping block in item 18.
 
 ### Reference quality
 
-- [ ] **`UtilizationScaling` parameters are unexplained** — 9 params with no per-param meaning. Add a parameter table: what each does, sensible defaults, when to tune.
-- [ ] **`Last(value)` is in the API table but never explained in prose** — it's load-bearing (in Guarantees) but has no narrative section. Add a "Stopping the chain from inside a transformer" subsection.
-- [ ] **Clarify `set_error_handler` vs constructor option** — is there a `flow(stages, on_error=...)` form? Document either way.
+- [x] **`UtilizationScaling` parameters are unexplained** — added inline comments to every parameter in the constructor example, plus a "How it works" section explaining the sampling+cooldown gates and the scale-up/scale-down logic, plus a "Tuning guide" with four common scenarios (bursty, steady, expensive workers, high-throughput).
+- [x] **`Last(value)` is in the API table but never explained in prose** — added a new "Stopping from inside a transformer — `Last(value)`" subsection in "Driving a flow", right before the existing "Stopping a running flow" subsection. Covers use case (terminator-marker pattern), code example, what the user observes, the guarantee, and the `Dropped(...,UPSTREAM_TERMINATED)` events for dropped upstream items.
+- [x] **Clarify `set_error_handler` vs constructor option** — both forms now documented. Constructor accepts `on_error=`, `default_scaling=`, `default_queue=` as shorthand for the corresponding methods. Per-stage configuration remains method-only. Updated DESIGN.md (DSL section), README "Configuring a flow" (split into Constructor keywords / Methods subsections), Public API table, and added an implementation item to `migrate-to-flow.md`.
 
 ### Production / debugging
 
-- [ ] **Add a debugging / dev story.** `dump()` is mentioned but never shown. Add an example of dump output in both modes.
-- [ ] **No troubleshooting guide.** What happens when the pipeline misbehaves? Common failure modes and how to diagnose.
+- [x] **Add a debugging / dev story.** Both items needed for this — README example showing `dump()` output, and a "debugging" subsection that points to `dump()` as the first thing to try — already exist in [`dump-implementation.md`](dump-implementation.md) under its Documentation section. They'll be done as part of building `dump()` (real output to show, not hypothetical).
+- [x] **No troubleshooting guide.** Moved to [`migrate-to-flow.md`](migrate-to-flow.md) Polish section. Will be written based on real failure modes encountered during implementation and testing — writing it now without a runtime to validate against would be speculative.
 
 ### Polish
 
-- [ ] **Markdown rendering risk in tables** — escaped `\|` pipes in cells like `dump(mode="structure" \| "stats")` look ugly. Rewrite as separate column or note.
-- [ ] **Push-mode "Why a separate `PushHandle`?" subsection** is design rationale that doesn't help users — move to DESIGN.md, leave a one-liner in README.
-- [ ] **Consider whether two mermaid diagrams in Architecture are too much** — the class diagram has 8+ entities and signals "complex framework" to evaluators. Either simplify or remove the class diagram (keep the Pipeline Flow one).
+- [x] **Markdown rendering risk in tables** — only one instance: `flow.dump(mode="structure" \| "stats")`. Rewrote as `flow.dump(mode=...)` with prose describing the two modes in the same cell. No escaped pipes remain.
+- [x] **Push-mode "Why a separate `PushHandle`?" subsection** — moved the rationale ("Why a separate PushHandle type") to DESIGN.md under the Drive modes section. The README's "Driving a flow" intro now says only the user-relevant fact ("Push mode returns a `PushHandle`; `send()` and `complete()` live on the handle"). Same thing in the "type-level separation" sentence — trimmed.
+- [x] **Consider whether two mermaid diagrams in Architecture are too much** — moved the 11-entity class diagram to DESIGN.md ("Component class diagram" subsection). README's "Component overview" subsection is now a short paragraph pointing to DESIGN.md and noting that Pipeline Flow below is enough for day-to-day use. Pipeline Flow diagram kept in README.
 
 ## Done
 

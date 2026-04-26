@@ -122,19 +122,19 @@ The **item source** is external to the flow. It's whatever drives items into que
 
 A middle stage. Multiple workers, auto-scaled (including scale-to-zero).
 
-There are two **call-shape transformers** (single-stage units the framework invokes per item):
+There are two **per-item transformers** (the framework invokes them once per item):
 
 | Shape you write | When to use |
 |---|---|
 | `async def f(x) -> y` | Simple stateless processing — parse, transform, enrich |
 | Factory `() -> AsyncContextManager` whose `__aenter__` returns an `async def fn(x) -> y` | Per-worker resource lifecycle — subprocess, DB connection, HTTP session |
 
-And two **graph fragments** (multi-stage units that get inlined into the parent's pipeline graph):
+And two **sub-pipelines** (multi-stage units that the framework expands into the parent pipeline at construction):
 
 | Shape you write | What happens |
 |---|---|
-| A `Flow` (from `flow(...)`) | Sub-flow's stages are stitched into the parent's graph; each keeps its own queue + workers + scaling. See [Composing flows](#composing-flows). |
-| A `Router` (from `router(...)`) | Each arm becomes a sub-graph; classifier dispatches items to the chosen arm. See [Routing](#routing). |
+| A `Flow` (from `flow(...)`) | Sub-flow's stages are stitched into the parent pipeline; each keeps its own queue + workers + scaling. See [Composing flows](#composing-flows). |
+| A `Router` (from `router(...)`) | Each arm becomes a sub-pipeline; classifier dispatches items to the chosen arm. See [Routing](#routing). |
 
 #### Plain async function
 
@@ -246,11 +246,11 @@ Both `@asynccontextmanager`-decorated functions and classes implementing `__aent
 
 #### Sub-flow — `Flow`
 
-Sub-flows are graph fragments — when a `Flow` appears inside another `flow(...)`, its stages are inlined into the parent's pipeline graph at construction. See [Composing flows](#composing-flows) under "Designing a flow" for the full treatment, including namespaced stage names and how to override sub-flow config from the parent.
+When a `Flow` appears inside another `flow(...)`, its stages are folded into the parent pipeline at construction. See [Composing flows](#composing-flows) under "Designing a flow" for the full treatment, including how sub-flow stage names work and how to override sub-flow config from the parent.
 
 #### Router — `Router`
 
-Routers are graph fragments — see [Routing](#routing) under "Designing a flow" for the full treatment, including the effective graph, arm dispatch, and behavior on classifier miss.
+When a `Router` appears inside `flow(...)`, each arm becomes its own sub-pipeline. See [Routing](#routing) under "Designing a flow" for the full treatment, including the effective pipeline shape, arm dispatch, and behavior on classifier miss.
 
 ### Worker lifecycle and scaling
 
@@ -300,7 +300,7 @@ await chain.run(reader)
 
 ### Routing
 
-`router()` dispatches each item to one of several arms based on a classifier function. It's a graph fragment, not a function call — each arm becomes its own sub-graph in the parent pipeline, with its own input queue and worker pool.
+`router()` dispatches each item to one of several arms based on a classifier function. It's a sub-pipeline, not a function call — each arm becomes its own mini-pipeline inside the parent, with its own input queue and worker pool.
 
 #### Signature
 
@@ -347,7 +347,7 @@ If the classifier returns a label that has no matching arm and no `default` is s
 
 ### Composing flows
 
-A flow can be embedded as a stage in another flow. The framework **expands the sub-flow's stages into the parent's pipeline graph** at construction — sub-flows are graph fragments, not function calls. Each sub-stage retains its own queue, worker pool, scaling, and config. Activation (`run`, `push`) only happens on the outermost flow.
+A flow can be embedded as a stage in another flow. The framework **folds the sub-flow's stages into the parent pipeline** at construction — sub-flows are not function calls; their stages become real stages of the parent. Each sub-stage retains its own queue, worker pool, scaling, and config. Activation (`run`, `push`) only happens on the outermost flow.
 
 ```python
 ingest = flow(parse, validate)
@@ -367,15 +367,15 @@ items → [queue] → ingest.parse → [queue] → ingest.validate → [queue] �
 
 Four stages, three queues. `ingest.validate` keeps its 1–8 worker pool exactly as `ingest.configure` specified — composition does not change scaling. The first `ingest.parse` worker pushes its output into `ingest.validate`'s input queue and moves on. Items flow through autonomously.
 
-#### Namespaced stage names
+#### Stage names in the parent
 
-Sub-flow stages are namespaced in the parent with the sub-flow's variable name as a prefix: `ingest.parse`, `ingest.validate`. You can override config from the parent:
+Sub-flow stages get the sub-flow's variable name as a prefix in the parent: `ingest.parse`, `ingest.validate`. You can override their config from the parent using the dotted name:
 
 ```python
 main.configure("ingest.parse", scaling=FixedScaling(workers=2))
 ```
 
-Recursion works — a sub-flow can contain sub-flows; names compose dotted (`outer.middle.inner.stage`).
+Sub-flows can contain sub-flows; names compose dotted (`outer.middle.inner.stage`).
 
 #### The same flow runs standalone or composed
 
@@ -399,8 +399,7 @@ Override when needed:
 ```python
 from flowrhythm import stage
 
-main = flow(
-    reader,
+chain = flow(
     stage(normalize, name="parse"),
     db_write,
 )
@@ -410,27 +409,47 @@ main = flow(
 
 ## Configuring a flow
 
-Configuration is operational — it tunes how the flow runs without changing what it does.
+Configuration is operational — it tunes how the flow runs without changing what it does. Two equivalent styles are available: constructor keywords (one-shot setup) and methods (incremental, e.g. reading from a config file).
+
+### Constructor keywords (shorthand)
 
 ```python
-from flowrhythm import flow, FixedScaling, UtilizationScaling, lifo_queue, priority_queue
+from flowrhythm import flow, FixedScaling, priority_queue
+
+chain = flow(
+    normalize, db_write,
+    on_error=on_error,
+    default_scaling=FixedScaling(workers=2),
+    default_queue=priority_queue,
+)
+await chain.run(items)
+```
+
+`on_error`, `default_scaling`, and `default_queue` cover **flow-level** configuration. Per-stage configuration (different scaling for one specific stage) needs the method form.
+
+### Methods (incremental)
+
+```python
+from flowrhythm import flow, FixedScaling, UtilizationScaling, priority_queue
 
 chain = flow(normalize, db_write)
-
-# Per-stage tuning
-chain.configure("normalize", scaling=UtilizationScaling(max_workers=8))
-chain.configure("priority_stage", queue=priority_queue)
 
 # Pipeline-wide defaults
 chain.configure_default(scaling=FixedScaling(workers=2))
 
-# Error sink (last resort for uncaught exceptions in transformers)
+# Per-stage tuning (only via method — no constructor shorthand)
+chain.configure("normalize", scaling=UtilizationScaling(max_workers=8))
+chain.configure("normalize", queue=priority_queue)
+
+# Error handler
 chain.set_error_handler(on_error)
 
-await chain.run(reader)
+await chain.run(items)
 ```
 
-The same chain definition can be configured differently per environment, and activated against different sources:
+The two forms are fully equivalent — pick whichever fits your code shape.
+
+### Same chain, different environments
 
 ```python
 def build():
@@ -456,21 +475,42 @@ FixedScaling(workers=4)
 ```
 
 ### UtilizationScaling
-Adjusts worker count based on busy/idle ratio. Supports scale-to-zero via `min_workers=0`.
+
+Adjusts worker count based on the busy/idle ratio. Supports scale-to-zero via `min_workers=0`.
+
 ```python
 UtilizationScaling(
-    min_workers=0,          # scale-to-zero allowed
-    max_workers=8,
-    lower_utilization=0.2,
-    upper_utilization=0.8,
-    upscaling_rate=2,
-    downscaling_rate=1,
-    cooldown_seconds=5.0,
-    dampening=0.5,
-    sampling_period=2.0,
-    sampling_events=50,
+    min_workers=0,           # never scale below this
+    max_workers=8,           # never scale above this
+    lower_utilization=0.2,   # if busy/total < 0.2, consider scaling down
+    upper_utilization=0.8,   # if busy/total > 0.8, consider scaling up
+    upscaling_rate=2,        # max workers added per scale-up decision
+    downscaling_rate=1,      # max workers removed per scale-down decision
+    cooldown_seconds=5.0,    # minimum seconds between scale events (anti-flap)
+    dampening=0.5,           # multiplier on rate — 0.5 means add/remove half
+    sampling_period=2.0,     # only consider scaling every N seconds
+    sampling_events=50,      # only consider scaling every N items
 )
 ```
+
+#### How it works
+
+On every item enqueue/dequeue, the strategy checks whether to scale. Two gates run first:
+
+1. **Sampling** — if `sampling_period` or `sampling_events` is set, scaling decisions are throttled (only consider every N seconds or every N events). This avoids checking on every single item in high-throughput stages. If both are set, both must pass.
+2. **Cooldown** — if a scale event happened within the last `cooldown_seconds`, do nothing. Prevents flapping between scale-up and scale-down.
+
+If both gates pass, the strategy reads `utilization = busy_workers / total_workers` and decides:
+- `utilization > upper_utilization` and `workers < max_workers` → scale up by `upscaling_rate × dampening` (rounded down, minimum 1)
+- `utilization < lower_utilization` and `workers > min_workers` → scale down by `downscaling_rate × dampening` (rounded down, minimum 1)
+- Otherwise → no change
+
+#### Tuning guide
+
+- **Bursty workload** — set higher `upscaling_rate` (e.g. 4-8) and lower `cooldown_seconds` (e.g. 1.0) to react quickly to spikes
+- **Steady workload** — keep defaults; `cooldown_seconds=5.0` and rate of 1-2 is calm and predictable
+- **Expensive workers** (subprocesses, GPU models) — keep `dampening` low (0.3-0.5) to scale conservatively
+- **High-throughput stage** — set `sampling_events=100` or `sampling_period=1.0` to avoid overhead from per-item scaling decisions
 
 ### Custom strategy
 Implement the protocol:
@@ -588,9 +628,7 @@ The flow definition (`flow(...)`) describes the **chain of stages**. To make ite
 | **Unbounded** — `await chain.run()` | The framework emits `None` signals indefinitely | External `chain.stop()` or first stage raises |
 | **Push** — `async with chain.push() as handle: await handle.send(item)` | You push items via a `PushHandle` | `handle.complete()` (explicit or via `async with` exit) |
 
-`Flow` exposes only the activation methods (`run`, `push`). Push mode returns a separate `PushHandle` type — `send()` and `complete()` live there, not on `Flow`. This is type-level separation: there is no way to call `send()` on a flow that hasn't been activated in push mode.
-
-`stop()` is always available on `Flow` for graceful shutdown.
+Push mode returns a `PushHandle` from `chain.push()`; `send()` and `complete()` live on the handle, not on `Flow`. `stop()` is always available on `Flow` for graceful shutdown.
 
 ### Bounded — `run(source)`
 
@@ -664,10 +702,6 @@ async with chain.push() as handle:
 
 If you need to signal end-of-stream before the `async with` exits (e.g., the producing loop ended but you still want to do work after), call `await handle.complete()` explicitly. Subsequent `send()` calls will raise.
 
-#### Why a separate `PushHandle`?
-
-`send()` only makes sense when push mode is active. Putting it on `Flow` would let users call it without first entering `chain.push()`, leading to runtime errors. Returning a separate `PushHandle` from `chain.push()` makes the type system enforce the rule — `Flow` has no `send()` method at all, so the mistake is impossible.
-
 ### Parallel ingestion
 
 If your bottleneck is fetching from an upstream system (Kafka with high throughput, paginated API with many pages, SQS poller), don't try to parallelize the source. Instead, put the parallelism in a **fetcher transformer** — the first stage of the chain — which can be scaled freely.
@@ -695,6 +729,29 @@ await chain.run()              # no source arg → framework emits None forever
 
 Same outcome, less boilerplate. The fetcher stage scales to as many workers as you need; each calls the upstream system independently.
 
+### Stopping from inside a transformer — `Last(value)`
+
+Sometimes the chain itself knows when to stop — a transformer that processes items until it sees a terminator marker, or a "process until X" pattern. Wrap the return value in `Last(value)` to signal "this is the final item":
+
+```python
+from flowrhythm import Last
+
+async def process_until_done(item):
+    if item.is_terminator:
+        return Last(process(item))      # process and signal end
+    return process(item)
+```
+
+What the user observes:
+1. The wrapped value (`process(item)`) flows downstream as the **final item** the sink will see.
+2. The chain immediately stops accepting new items. Anything still upstream of this transformer is dropped — those items will never reach the sink.
+3. Items already past this transformer continue to the sink in order.
+4. `chain.run(...)` returns once the sink has received the final item.
+
+The framework guarantees: **the value wrapped in `Last(value)` is the absolute last item the sink processes. Nothing comes after it.**
+
+Dropped upstream items are reported to the error handler as `Dropped(item, stage, reason=DropReason.UPSTREAM_TERMINATED)` events — by default, dropped items continue silently. If you need to log or capture them, set an error handler.
+
 ### Stopping a running flow
 
 The three activation modes above are the only public ways to drive a flow. Combined with `stop()` (abort) and `drain()` (graceful), they cover every legitimate scenario.
@@ -718,7 +775,7 @@ await task
 | Mode | What the user observes |
 |---|---|
 | `run(source)` | Framework calls `source.aclose()` on your generator; if you have `try/finally` cleanup in the generator, it runs. Then in-flight items finish. |
-| `run()` (auto-trigger) | Framework stops emitting `None` signals. In-flight items finish. |
+| `run()` (no source) | Framework stops emitting `None` signals. In-flight items finish. |
 | `chain.push()` | The next `send()` raises. In-flight items finish. (Usually you don't need to call `drain()` explicitly here — exit the `async with` instead.) |
 
 In all cases, `drain()` returns once every item that entered the chain has reached the sink or the error handler.
@@ -735,7 +792,7 @@ Exiting the `async with chain.push() as h:` block automatically calls `h.complet
 
 | Symbol | Kind | Purpose |
 |---|---|---|
-| `flow(*stages)` | function | Construct a flow from a sequence of stages |
+| `flow(*stages, on_error=None, default_scaling=None, default_queue=None)` | function | Construct a flow from a sequence of stages. Optional kwargs are shorthand for `set_error_handler` / `configure_default` |
 | `router(classifier, **arms, default=...)` | function | Construct a router for branching |
 | `stage(fn, name=...)` | function | Override the auto-derived name of a stage |
 | `sync_stage(fn)` *(planned)* | function | Wrap a sync function with `asyncio.to_thread` so it can be used as an async stage |
@@ -744,7 +801,7 @@ Exiting the `async with chain.push() as h:` block automatically calls `h.complet
 
 | Method on `Flow` | Purpose |
 |---|---|
-| `flow.run(source=None)` | Run autonomously. With an async-generator source: bounded; without: unbounded auto-trigger |
+| `flow.run(source=None)` | Run autonomously. With an async-generator source: bounded; without a source: unbounded (framework emits `None` signals) |
 | `flow.push()` | Enter push mode — returns an `AsyncContextManager[PushHandle]` |
 | `flow.drain()` | Graceful shutdown: stop the source (or `aclose()` your generator), wait for in-flight items to finish, then return |
 | `flow.stop()` | Abort: cancel workers, drop in-flight items, release resources |
@@ -761,7 +818,7 @@ Exiting the `async with chain.push() as h:` block automatically calls `h.complet
 | `flow.configure(name, scaling=..., queue=...)` | Per-stage tuning |
 | `flow.configure_default(scaling=..., queue=...)` | Pipeline-wide defaults |
 | `flow.set_error_handler(handler)` | Set the error sink for uncaught transformer exceptions |
-| `flow.dump(mode="structure" \| "stats")` | Inspect the flow — graph layout or live runtime stats |
+| `flow.dump(mode=...)` | Inspect the flow. `mode="structure"` renders the pipeline layout; `mode="stats"` renders live runtime stats |
 
 ### Types and helpers
 
@@ -826,103 +883,31 @@ Promises the framework makes to the user. If any of these are violated, it's a b
 - **Routing via `router()`.** Branching is a regular transformer that dispatches to sub-pipelines by label. Arms converge after the router.
 - **Retry/iteration belongs inside a stage**, not in the graph topology.
 
-### Component Overview
+### Component overview
 
-```mermaid
-classDiagram
-    class flow {
-        <<function>>
-        +flow(*stages) Flow
-    }
-
-    class router {
-        <<function>>
-        +router(classifier, **arms, default) Router
-    }
-
-    class stage {
-        <<function>>
-        +stage(fn, name) Stage
-    }
-
-    class Transformer {
-        <<duck-typed>>
-        async __call__(item) result
-    }
-
-    class Flow {
-        +run(source)
-        +push() AsyncContextManager~PushHandle~
-        +drain()
-        +stop()
-        +configure(name, scaling, queue)
-        +configure_default(scaling, queue)
-        +set_error_handler(handler)
-        +dump(mode)
-    }
-
-    class PushHandle {
-        +send(item)
-        +complete()
-    }
-
-    class Router {
-        +classifier
-        +arms
-        +default
-        async __call__(item)
-    }
-
-    class ScalingStrategy {
-        <<protocol>>
-        +on_enqueue(stats) int
-        +on_dequeue(stats) int
-    }
-    class FixedScaling
-    class UtilizationScaling
-
-    class StageStats {
-        +stage_name
-        +busy_workers
-        +idle_workers
-        +queue_length
-        +utilization()
-        +total_workers()
-    }
-
-    flow ..> Flow : returns
-    router ..> Router : returns
-    Flow ..> PushHandle : push() yields
-    Flow *-- Flow : inlined as sub-graph
-    Flow *-- Router : inlined as sub-graph
-    Router *-- Transformer : arms (call-shape)
-    Flow --> ScalingStrategy
-    ScalingStrategy <|.. FixedScaling
-    ScalingStrategy <|.. UtilizationScaling
-    ScalingStrategy <.. StageStats
-```
+The full type/relationship class diagram lives in [`DESIGN.md`](DESIGN.md#component-class-diagram). For day-to-day use, the Pipeline Flow diagram below is enough — it shows how items move through the system.
 
 ### How `flow()` processes each kind at construction
 
-`flow()` walks its arguments at construction. Some kinds become **graph fragments** (expanded into the parent's pipeline graph); others are **call-shape transformers** that occupy a single graph stage.
+`flow()` walks its arguments at construction. Some kinds are **sub-pipelines** (expanded into the parent pipeline); others are **per-item transformers** that occupy a single stage.
 
 ```python
 match stage:
     case Flow() as sub_flow:
-        # GRAPH FRAGMENT: expand sub_flow's stages into the parent's graph,
-        # namespaced as "<sub_flow_name>.<inner_stage>". Sub-flow's per-stage
-        # configuration is preserved unless overridden by the parent.
+        # SUB-PIPELINE: fold sub_flow's stages into the parent pipeline.
+        # Stage names get the sub-flow's name as a prefix (e.g. "ingest.parse").
+        # Sub-flow's per-stage configuration is preserved unless overridden by the parent.
     case Router() as r:
-        # GRAPH FRAGMENT: each arm becomes a sub-graph. Router's classifier
-        # runs as a single stage that dispatches to arm queues.
+        # SUB-PIPELINE: each arm becomes its own sub-pipeline. The classifier
+        # runs as a single stage that dispatches to arm pipelines.
     case ctx if callable(ctx) and len(inspect.signature(ctx).parameters) == 0:
-        # CALL-SHAPE: CM factory; framework calls factory() per worker,
+        # PER-ITEM: CM factory; framework calls factory() per worker,
         # enters the context, uses yielded callable per item.
     case fn if callable(fn) and len(inspect.signature(fn).parameters) == 1:
-        # CALL-SHAPE: plain async function; called per item.
+        # PER-ITEM: plain async function; called per item.
 ```
 
-After expansion, every stage in the runtime graph is a single call-shape transformer (plain async fn, CM factory, or router classifier). Each stage owns one input queue, a worker pool, and a scaling strategy.
+After expansion, every stage in the runtime pipeline is a single per-item transformer (plain async fn, CM factory, or router classifier). Each stage owns one input queue, a worker pool, and a scaling strategy.
 
 ### Pipeline Flow
 

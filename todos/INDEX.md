@@ -6,9 +6,9 @@ Index of TODO plans. Each plan is a markdown file with a status header and a che
 
 | Plan | Status | Updated |
 |---|---|---|
-| [readme-rewrite](readme-rewrite.md) | in-progress | 2026-04-26 |
 | [migrate-to-flow](migrate-to-flow.md) | planned | 2026-04-26 |
 | [dump-implementation](dump-implementation.md) | planned | 2026-04-26 |
+| [readme-rewrite](readme-rewrite.md) | implemented | 2026-04-26 |
 
 ## Status values
 

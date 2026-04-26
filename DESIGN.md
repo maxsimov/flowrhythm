@@ -2,21 +2,27 @@
 
 The design contract for flowrhythm — what's been decided, what's still open, and what's deferred for later.
 
-This is the source of truth for **how the library should behave**. The README documents the user-facing surface; this document documents the rules behind it.
-
-For concrete implementation work and progress tracking, see [`todos/INDEX.md`](todos/INDEX.md).
+This is the source of truth for **how the library should behave**. The README documents the user-facing surface; this document documents the rules behind it. Concrete implementation work lives in [`todos/`](todos/INDEX.md).
 
 ---
 
 ## Decided design
 
 ### DSL
-- Single entry point: `flow(*stages)` — lowercase function, returns a `Flow` instance
+- Single entry point: `flow(*stages, on_error=None, default_scaling=None, default_queue=None)` — lowercase function, returns a `Flow` instance
 - `Flow` (uppercase class) is exported for type hints only — users always construct via `flow(...)`, never via `Flow(...)`
 - No separate `pipe()` / `Builder` concept — `flow()` is both structure and runnable
-- **`flow()` accepts only transformers** — passing an async generator at any position is an error; the producer is supplied separately via `run()`
+- **`flow()` accepts only transformers as positional args** — passing an async generator at any position is an error; the producer is supplied separately via `run()`
 - Sink is **implicit** — the last stage in `flow()` plays the sink role when run autonomously (output dropped). The same flow used as a transformer in another flow forwards its last stage's output into the parent's downstream queue.
 - Stage names auto-derived from function names; collisions get numeric suffix; override via `stage(fn, name=...)`
+
+#### Flow-level config: constructor kwargs vs methods
+The constructor accepts three keyword arguments as shorthand:
+- `on_error=` — equivalent to calling `chain.set_error_handler(handler)` after construction
+- `default_scaling=` — equivalent to `chain.configure_default(scaling=...)`
+- `default_queue=` — equivalent to `chain.configure_default(queue=...)`
+
+Both forms are fully equivalent. Use the constructor form for one-shot setup; use the methods for incremental configuration (e.g., when reading from a config file). Per-stage configuration (`chain.configure("stage_name", ...)`) is method-only — there's no way to express it via constructor kwargs.
 
 ### Drive modes
 A `Flow` is symmetric — only how you activate it differs. Three modes, all on the same `Flow` instance:
@@ -29,9 +35,10 @@ A `Flow` is symmetric — only how you activate it differs. Three modes, all on 
 
 `Flow` exposes **activation modes** (`run`, `push`) but does not expose `send`/`complete` directly. Push mode returns a separate `PushHandle` type via `chain.push()`; `send()` and `complete()` live on `PushHandle`.
 
-This is type-level separation — there is no way to call `send()` on a `Flow`. No runtime mode-locking is needed.
-
 `stop()` is always available on `Flow` for graceful shutdown regardless of mode.
+
+#### Why a separate PushHandle type
+`send()` only makes sense when the flow has been activated in push mode. If `send()` lived on `Flow`, users could call it before (or instead of) entering `chain.push()`, requiring runtime mode-locking and producing confusing errors. Returning a separate `PushHandle` type from `chain.push()` makes the type system enforce the rule — `Flow` has no `send()` method, so the mistake is structurally impossible. No runtime mode tracking, no wrong-mode exceptions, no docs to read.
 
 ### Routing
 - `router(classifier, **arms, default=...)` — branching as a regular transformer
@@ -201,6 +208,84 @@ class Dropped:
 - Pipeline-wide default + per-stage override
 - Built-in: `fifo_queue`, `lifo_queue`, `priority_queue`
 
+### Component class diagram
+
+The full type structure: factory functions, the `Flow` and `Router` classes, the `PushHandle` returned from push mode, the `Transformer` duck-typed shape, and the `ScalingStrategy` protocol with built-in implementations.
+
+```mermaid
+classDiagram
+    class flow {
+        <<function>>
+        +flow(*stages) Flow
+    }
+
+    class router {
+        <<function>>
+        +router(classifier, **arms, default) Router
+    }
+
+    class stage {
+        <<function>>
+        +stage(fn, name) Stage
+    }
+
+    class Transformer {
+        <<duck-typed>>
+        async __call__(item) result
+    }
+
+    class Flow {
+        +run(source)
+        +push() AsyncContextManager~PushHandle~
+        +drain()
+        +stop()
+        +configure(name, scaling, queue)
+        +configure_default(scaling, queue)
+        +set_error_handler(handler)
+        +dump(mode)
+    }
+
+    class PushHandle {
+        +send(item)
+        +complete()
+    }
+
+    class Router {
+        +classifier
+        +arms
+        +default
+        async __call__(item)
+    }
+
+    class ScalingStrategy {
+        <<protocol>>
+        +on_enqueue(stats) int
+        +on_dequeue(stats) int
+    }
+    class FixedScaling
+    class UtilizationScaling
+
+    class StageStats {
+        +stage_name
+        +busy_workers
+        +idle_workers
+        +queue_length
+        +utilization()
+        +total_workers()
+    }
+
+    flow ..> Flow : returns
+    router ..> Router : returns
+    Flow ..> PushHandle : push() yields
+    Flow *-- Flow : folded into parent
+    Flow *-- Router : folded into parent
+    Router *-- Transformer : arms
+    Flow --> ScalingStrategy
+    ScalingStrategy <|.. FixedScaling
+    ScalingStrategy <|.. UtilizationScaling
+    ScalingStrategy <.. StageStats
+```
+
 ---
 
 ## Open questions
@@ -218,10 +303,3 @@ class Dropped:
 
 ---
 
-## Implementation work
-
-Concrete, trackable implementation tasks live in [`todos/INDEX.md`](todos/INDEX.md). Active plans:
-
-- [`migrate-to-flow`](todos/migrate-to-flow.md) — rebuild the runtime to match the documented `flow()` API
-- [`dump-implementation`](todos/dump-implementation.md) — implement `Flow.dump()` in structure and stats modes
-- [`readme-rewrite`](todos/readme-rewrite.md) — clean up the README for newcomer evaluators
