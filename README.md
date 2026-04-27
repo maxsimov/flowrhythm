@@ -63,7 +63,8 @@ Those are stream-processing frameworks for real Kafka-scale stream workloads, wi
 ```bash
 pip install flowrhythm
 ```
-_Not yet published. Use `pip install .` locally from source._
+
+Requires Python 3.13+. Zero runtime dependencies.
 
 ---
 
