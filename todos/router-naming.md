@@ -1,6 +1,6 @@
 # Router naming improvements
 
-**Status:** planned
+**Status:** implemented
 **Updated:** 2026-04-27
 
 ## Motivation
@@ -21,22 +21,21 @@ chain = flow(
 
 ## Items
 
-- [ ] **Auto-derive router name from classifier `__name__`.** When `router(classifier, ...)` is given without an enclosing `stage(name=...)`, use `classifier.__name__` as the auto-name (subject to the existing collision-suffix rule). Keeps the symmetry with plain functions.
-- [ ] **Optional `name` kwarg on `router()`.** Like `default`, a reserved kwarg name. Lets users explicitly name without wrapping in `stage()`:
-    ```python
-    router(classify, name="dispatch", fast=fast, slow=slow)
-    ```
-  Reserves `name` as an arm label (already true for `default`); document the limitation.
-- [ ] **Decide precedence.** If the user wraps a router in `stage(router(...), name="X")` AND passes `name="Y"` to the router AND the classifier is named `Z`: most-specific wins (`stage(name=)` > `router(name=)` > classifier `__name__` > fallback `_router_N`).
-- [ ] **Update example** — switch `examples/video_pipeline.py` to rely on the auto-derived classifier name (likely renaming `classify_for_conversion` to something like `classify_video` for nicer output).
-- [ ] **Tests.** Cover: auto-name from classifier; explicit `name=` kwarg; both-set precedence; collision suffix when two routers have the same classifier name; lambda classifier falls back to `_router_N`.
-- [ ] **DESIGN.md** — update the Routing section to document naming rules.
+- [x] **Auto-derive router name from classifier `__name__`.** Implemented in `flow()`'s router-expansion branch. Symmetric with how plain functions are auto-named.
+- [x] **Optional `name` kwarg on `router()`.** Reserved alongside `default`; popped from `**arms` in the factory; rejected if not a non-empty string.
+- [x] **Precedence implemented:** `stage(router(..), name="X")` > `router(.., name="Y")` > `classifier.__name__` (skipped for `<lambda>`) > `_router_N` fallback.
+- [x] **Lambda classifier falls back to `_router_N`** (when `__name__` is `"<lambda>"`).
+- [x] **Arm-prefix uniqueness done at expansion time, NOT post-suffix.** Catches the "two routers same classifier" case correctly: `classify`, `classify.a`, `classify_2`, `classify_2.b` (instead of the broken `classify.b`). The collision check runs against all base names previously added to `raw_items` before arms are appended.
+- [x] **Updated example** — `examples/video_pipeline.py` now uses `router(classify_for_conversion, name="dispatch", ...)` showing both the auto-derived name path AND the explicit `name=` override path. Output shows `dispatch`, `dispatch.convert.download`, etc. — no `_router_0`.
+- [x] **Tests** in `tests/test_router_naming.py` (10 tests): auto-derive; lambda fallback; explicit `name=` kwarg; `name=` + `default=` together; full precedence chain; classifier-name beats fallback; two routers same classifier → suffixed prefix; two unnamed-lambda routers → indexed; reject empty `name=""`; routing functionality preserved with auto-derived name.
+- [x] **DESIGN.md** Routing section updated with the new naming-precedence rules and a "Router naming" subsection. Reserved kwargs (`default`, `name`) listed.
+- [x] **Existing tests updated**: `test_router_fallback_name_uses_router_index` and `test_two_unwrapped_routers_get_distinct_indices` adjusted since they were pinned to the old `_router_N` behaviour for non-lambda classifiers.
 
-## Open questions
+## Open questions (resolved)
 
-- Should `name="default"` be allowed? It's both an arm-label keyword AND would now be a router-name keyword. Disallowing avoids ambiguity but is a small papercut.
-- Lambda classifiers have `__name__ == "<lambda>"` — ugly. Fallback to `_router_N` for that case probably best.
+- `name="default"` as an arm label: not allowed (both `default` and `name` are reserved kwargs). Deemed acceptable — arm labels are usually domain words, not config words. Documented in DESIGN.
+- Lambdas: fall back to `_router_N` since `<lambda>` would be misleading as a stage name.
 
-## Why now
+## Done
 
-Surfaced when writing `examples/video_pipeline.py`. Without this, the example either uses `stage(name=)` (which we want to de-emphasize as an "always optional" feature) or shows `_router_0` in its dump output (which is genuinely ugly for a "real-world" demo). Picking up this feature would let the example just work with sensible defaults.
+- 211 tests pass (was 187, +24 — 10 from `test_router_naming.py` + retained existing). Lint clean. Example output now shows clean stage names like `dispatch.convert.download`.

@@ -49,13 +49,26 @@ No special timing logic, no rate config. Users who want different behavior have 
 - **Rate-limited emission** — add `await asyncio.sleep(...)` inside the user's first transformer (the fetcher)
 
 ### Routing
-- `router(classifier, **arms, default=...)` — branching expanded as a sub-graph at construction (NOT a per-item function call)
+- `router(classifier, **arms, default=..., name=...)` — branching expanded as a sub-graph at construction (NOT a per-item function call)
 - The classifier runs as a single stage that dispatches each item to one arm's input queue
 - Arms can be plain async functions, CM factories, or `Flow` sub-pipelines — each gets its own input queue and worker pool
 - All arm outputs converge into the same merge queue (the stage right after the router in the parent)
 - If the classifier returns a label with no matching arm and no `default`, the item is dropped and the error handler receives a `Dropped(reason=DropReason.ROUTER_MISS)` event (observer-only — pipeline continues)
 - A classifier returning `Last(value)` is rejected with `TypeError` (routed to the handler as a `TransformerError`). Classifiers must return labels, not termination markers; to terminate from within a router, the corresponding arm transformer should return `Last(value)`, or call `Flow.stop()` externally.
 - Nested routers are supported: an arm can be a `Flow` containing another router. The inner router's terminal stages (its merge stage, or its arm-ends if no inner merge) become the outer arm's "ends" feeding the outer merge.
+
+#### Router naming
+
+Naming precedence for the classifier stage (most specific wins):
+
+1. `stage(router(...), name="X")` — explicit wrapper
+2. `router(..., name="Y")` — kwarg on the factory
+3. `classifier.__name__` — auto-derived (skipped for lambdas, where `__name__` is `"<lambda>"`)
+4. Fallback `_router_N` — N is a per-flow counter
+
+The chosen name becomes the prefix for arm stages (`<router_name>.<arm_label>` for callable arms; `<router_name>.<arm_label>.<sub_stage>` for sub-flow arms). Arm prefixes are made unique at expansion time (before arm stages are added) so two routers auto-deriving to the same classifier name produce consistent names: e.g. `classify`, `classify.a`, `classify_2`, `classify_2.b` (not `classify`, `classify.a`, `classify_2`, `classify.b`, which would be a confusing dump).
+
+Reserved kwarg names on `router()`: `default`, `name`. These cannot be used as arm labels (no real-world conflict since arm labels are usually domain words, not config words).
 
 ### Composability
 - A `Flow` plugs into another `flow()` as a stage

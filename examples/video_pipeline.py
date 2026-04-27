@@ -197,6 +197,7 @@ async def main():
         fetch_metadata,
         router(
             classify_for_conversion,
+            name="dispatch",     # router(name=) — short stage name in dump output
             convert=flow(download, transcode),
             passthrough=download,
         ),

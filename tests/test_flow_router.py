@@ -189,7 +189,12 @@ async def test_router_explicit_name_via_stage():
     assert "my_router.a" in chain.stage_names
 
 
-async def test_router_fallback_name_uses_router_index():
+async def test_router_auto_derives_name_from_classifier_function():
+    """When `router()` isn't wrapped in `stage(name=...)` and no
+    `name=` kwarg is given, the router takes the classifier's
+    `__name__`. (See `tests/test_router_naming.py` for full coverage
+    of the naming precedence rules.)"""
+
     async def classify(x):
         return "a"
 
@@ -197,11 +202,11 @@ async def test_router_fallback_name_uses_router_index():
         pass
 
     chain = flow(router(classify, a=a))
-    assert "_router_0" in chain.stage_names
-    assert "_router_0.a" in chain.stage_names
+    assert "classify" in chain.stage_names
+    assert "classify.a" in chain.stage_names
 
 
-async def test_two_unwrapped_routers_get_distinct_indices():
+async def test_two_unwrapped_routers_with_distinct_classifiers():
     async def cls1(x):
         return "a"
 
@@ -217,13 +222,11 @@ async def test_two_unwrapped_routers_get_distinct_indices():
     async def collect(x):
         pass
 
-    r1 = router(cls1, a=a)
-    r2 = router(cls2, b=b)
-    chain = flow(r1, r2, collect)
-    assert "_router_0" in chain.stage_names
-    assert "_router_0.a" in chain.stage_names
-    assert "_router_1" in chain.stage_names
-    assert "_router_1.b" in chain.stage_names
+    chain = flow(router(cls1, a=a), router(cls2, b=b), collect)
+    assert "cls1" in chain.stage_names
+    assert "cls1.a" in chain.stage_names
+    assert "cls2" in chain.stage_names
+    assert "cls2.b" in chain.stage_names
 
 
 # ---------------------------------------------------------------------------

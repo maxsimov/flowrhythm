@@ -145,30 +145,39 @@ class Router:
     "Routing" for usage.
     """
 
-    __slots__ = ("classifier", "arms", "default")
+    __slots__ = ("classifier", "arms", "default", "name")
 
     def __init__(
         self,
         classifier: TransformerFn,
         arms: dict[str, Any],
         default: Any | None,
+        name: str | None = None,
     ) -> None:
         self.classifier = classifier
         self.arms = arms
         self.default = default
+        self.name = name
 
 
 def router(classifier: TransformerFn, /, **arms: Any) -> Router:
     """Construct a router for branching by label.
 
         router(classify, fast=quick, slow=heavy_path, default=passthrough)
+        router(classify, name="dispatch", fast=quick, slow=heavy_path)
 
     `classifier` is `async def (item) -> label`. Each keyword arg is an arm
     keyed by label; arms can be plain async functions, CM factories, or
-    `Flow` instances. The reserved keyword `default=` is a fallback arm for
-    labels that don't match any other arm. If no `default` is set and the
-    classifier returns an unknown label, the item is dropped and the error
-    handler receives a `Dropped(reason=DropReason.ROUTER_MISS)` event.
+    `Flow` instances. Reserved keywords:
+
+    - `default=` — fallback arm for labels that don't match any other arm.
+      If unset and the classifier returns an unknown label, the item is
+      dropped and the error handler receives a
+      `Dropped(reason=DropReason.ROUTER_MISS)` event.
+    - `name=` — explicit name for this router stage. Overrides the
+      auto-derived name from the classifier's `__name__`. Useful for
+      shadowing long classifier names or for lambda classifiers (which
+      otherwise fall back to `_router_N`).
     """
     if not inspect.iscoroutinefunction(classifier):
         raise TypeError(
@@ -181,11 +190,14 @@ def router(classifier: TransformerFn, /, **arms: Any) -> Router:
             "router() classifier must take exactly one argument (the item)"
         )
 
+    name = arms.pop("name", None)
+    if name is not None and (not isinstance(name, str) or not name):
+        raise TypeError("router(name=...) must be a non-empty string")
     default = arms.pop("default", None)
     if not arms and default is None:
         raise TypeError("router() requires at least one arm")
 
-    return Router(classifier=classifier, arms=arms, default=default)
+    return Router(classifier=classifier, arms=arms, default=default, name=name)
 
 
 @dataclass
@@ -1480,14 +1492,37 @@ def flow(
             explicit_name = None
             target = arg
 
-        # Router expansion: classifier stage + per-arm sub-graphs
+        # Router expansion: classifier stage + per-arm sub-graphs.
+        # Naming precedence (most specific wins):
+        #   1. stage(router(...), name="X")  → explicit_name
+        #   2. router(..., name="Y")         → target.name
+        #   3. classifier.__name__           → if not "<lambda>"
+        #   4. fallback                      → "_router_N"
+        # Also: ensure the chosen name is unique against any prior stage
+        # name BEFORE the arms are appended — arm names are prefixed with
+        # router_name, so a late suffix would leave arm prefixes pointing
+        # at the wrong (original) name. The collision check covers all
+        # previously-added base names, so two routers auto-deriving to
+        # "classify" become "classify" and "classify_2" with consistent
+        # prefixes ("classify.a", "classify_2.b").
         if isinstance(target, Router):
-            router_name = (
-                explicit_name
-                if explicit_name is not None
-                else f"_router_{router_counter}"
-            )
+            if explicit_name is not None:
+                candidate_name = explicit_name
+            elif target.name is not None:
+                candidate_name = target.name
+            else:
+                cls_name = getattr(target.classifier, "__name__", None)
+                if cls_name and cls_name != "<lambda>":
+                    candidate_name = cls_name
+                else:
+                    candidate_name = f"_router_{router_counter}"
             router_counter += 1
+            existing_names = {bn for bn, _, _, _ in raw_items}
+            router_name = candidate_name
+            collision_n = 2
+            while router_name in existing_names:
+                router_name = f"{candidate_name}_{collision_n}"
+                collision_n += 1
 
             # 1. Reserve the classifier stage slot. Factory is a placeholder;
             #    _FlowRun.__init__ replaces it with the dispatch wrapper
@@ -1699,7 +1734,8 @@ def flow(
             assert isinstance(hint, _ArmEndHint)
             hint.merge_stage_idx = merge_idx
 
-    # Phase 2: collision-suffix names
+    # Phase 2: collision-suffix non-router names. Routers were already
+    # uniquified at expansion time so their arm prefixes stay correct.
     counts: dict[str, int] = {}
     final_items: list[
         tuple[str, StageFactory, Any | None, dict[str, Any] | None]
