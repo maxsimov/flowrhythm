@@ -14,6 +14,7 @@
 
 - [When to use flowrhythm](#when-to-use-flowrhythm) — fit signals, and "why not Celery / Faust / asyncio.Queue"
 - [Installation](#installation)
+- [Real-world example](#real-world-example) — pointer to `examples/video_pipeline.py`
 - [Quick Start](#quick-start)
 - [Stages](#stages) — what's inside a stage, the four transformer shapes, how each is invoked
 - [Designing a flow](#designing-a-flow) — linear, reusable chains, routing, sub-flow composition, naming
@@ -65,6 +66,16 @@ pip install flowrhythm
 ```
 
 Requires Python 3.13+. Zero runtime dependencies.
+
+---
+
+## Real-world example
+
+For a full worked example showing per-stage scaling, CM-factory resource handling, a router with sub-flow arms, error handling, and `dump()` output — see [`examples/video_pipeline.py`](examples/video_pipeline.py). It models a video-processing job (fetch metadata → conditionally transcode with ffmpeg → upload → record in DB) with all external calls mocked, so it runs without yt-dlp / ffmpeg / S3 set up.
+
+```
+python examples/video_pipeline.py
+```
 
 ---
 
