@@ -313,6 +313,13 @@ class _StageRuntime:
     # contributing arm-ends; their queue is shut down only when all
     # contributors have signaled drain.
     pending_inputs: int = 1
+    # If this stage is inside a router arm sub-graph, the merge index of
+    # the enclosing arm — used by `_handle_last` to extend the kill range
+    # to the merge (rather than just the immediate downstream), so a Last
+    # firing from inside an arm correctly halts sibling arms too. None
+    # for stages outside any arm. For nested arms the OUTERMOST merge
+    # wins (first-set takes precedence in `_FlowRun.__init__`).
+    arm_merge_idx: int | None = None
 
 
 class Flow:
@@ -609,6 +616,47 @@ class _FlowRun:
         for idx in merge_indices:
             self._stages[idx].pending_inputs -= 1
 
+        # Annotate each in-arm stage with its enclosing arm's merge index.
+        # Used by `_handle_last` to extend the Last cascade's kill range
+        # to the merge — without this, a Last firing from the middle of
+        # a multi-stage arm only kills its immediate downstream chain,
+        # leaving sibling arms running and injecting items past Last.
+        # Iteration order matters: outer classifiers come before inner
+        # in stage-index order, so first-wins (don't overwrite already-
+        # set values) yields the OUTERMOST arm_merge_idx for nested arms.
+        for i, (_, _, hint) in enumerate(flow._stages):
+            if not isinstance(hint, _ClassifierHint):
+                continue
+            arm_starts = sorted(hint.arm_first_stage_idx.values())
+            if hint.default_first_stage_idx is not None:
+                arm_starts = sorted(arm_starts + [hint.default_first_stage_idx])
+            # Find merge_idx by inspecting any arm-end's _ArmEndHint
+            merge_idx: int | None = None
+            for arm_first in arm_starts:
+                for k in range(arm_first, len(flow._stages)):
+                    _, _, h = flow._stages[k]
+                    if isinstance(h, _ArmEndHint):
+                        if h.merge_stage_idx >= 0:
+                            merge_idx = h.merge_stage_idx
+                        break
+                if merge_idx is not None:
+                    break
+            if merge_idx is None:
+                continue  # router with no merge (arm outputs sink)
+            # Each arm spans [arm_starts[j], arm_starts[j+1] - 1] (or
+            # merge_idx - 1 for the last arm). Mark every stage in that
+            # range with arm_merge_idx — first-wins (outer arms override
+            # inner reassignments).
+            for j, arm_first in enumerate(arm_starts):
+                arm_last = (
+                    arm_starts[j + 1] - 1
+                    if j + 1 < len(arm_starts)
+                    else merge_idx - 1
+                )
+                for k in range(arm_first, arm_last + 1):
+                    if self._stages[k].arm_merge_idx is None:
+                        self._stages[k].arm_merge_idx = merge_idx
+
         # Error handling — observer pattern: handler is called with typed
         # events. If the handler raises, we log and continue (handler is
         # not a flow-control mechanism; use Flow.stop() to abort externally).
@@ -678,16 +726,36 @@ class _FlowRun:
         """
         s = self._stages[stage_idx]
         my_task = asyncio.current_task()
-        # If `s.downstream_stage_idx` is None (sink), the kill range is
-        # everything before the sink — i.e., `[0, _n)`.
-        end_exclusive = (
-            s.downstream_stage_idx
-            if s.downstream_stage_idx is not None
-            else self._n
-        )
+        # Compute the kill range. For stages inside a router arm, extend
+        # to the enclosing arm's merge — otherwise sibling arms would
+        # keep injecting items past the Last value. For stages outside
+        # any arm, fall back to `downstream_stage_idx` (or `_n` if this
+        # is the last stage).
+        if s.arm_merge_idx is not None:
+            end_exclusive = s.arm_merge_idx
+        elif s.downstream_stage_idx is not None:
+            end_exclusive = s.downstream_stage_idx
+        else:
+            end_exclusive = self._n
 
-        # Step 1: kill every upstream path that could feed the destination.
+        # If we're inside an arm and the kill range extends past our own
+        # immediate downstream, walk forward along OUR chain (downstream →
+        # downstream → ...) up to but not including the merge — those
+        # stages must stay alive so the Last value can propagate. Stages
+        # outside our chain (sibling arms, classifier, upstream) get
+        # killed normally.
+        my_chain: set[int] = set()
+        if s.arm_merge_idx is not None and s.downstream_stage_idx is not None:
+            cur: int | None = s.downstream_stage_idx
+            while cur is not None and cur < end_exclusive:
+                my_chain.add(cur)
+                cur = self._stages[cur].downstream_stage_idx
+
+        # Step 1: kill every upstream path that could feed the destination,
+        # except this initiator's own downstream chain.
         for i in range(end_exclusive):
+            if i in my_chain:
+                continue
             try:
                 self._stages[i].queue.shutdown(immediate=False)  # type: ignore[attr-defined]
             except Exception:
@@ -701,10 +769,12 @@ class _FlowRun:
             if sibling is not my_task:
                 sibling.cancel()
 
-        # Step 3: poll until the kill range has fully drained.
+        # Step 3: poll until every killed stage has fully drained.
         while True:
             done = True
             for i in range(end_exclusive):
+                if i in my_chain:
+                    continue  # chain stays alive to deliver Last
                 expected = 1 if i == stage_idx else 0
                 if self._stages[i].alive > expected:
                     done = False
