@@ -114,6 +114,54 @@ def sync_stage(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
 
 
 @dataclass
+class _NamedStage:
+    """Internal wrapper from `stage(target, name=...)`. Carries the explicit
+    name override that `flow()` recognises — for transformer renaming or
+    sub-flow prefixing."""
+
+    target: Any
+    name: str
+
+
+def stage(target: Any, *, name: str) -> _NamedStage:
+    """Override the auto-derived name of a transformer or assign an explicit
+    prefix to a sub-flow.
+
+        chain = flow(
+            stage(normalize, name="parse"),     # rename a transformer
+            stage(inner_flow, name="ingest"),   # name a sub-flow
+            sink,
+        )
+    """
+    if not isinstance(name, str) or not name:
+        raise TypeError("stage(name=...) must be a non-empty string")
+    return _NamedStage(target=target, name=name)
+
+
+def _resolve_subflow_stage_config(
+    subflow: "Flow", sub_name: str
+) -> dict[str, Any]:
+    """Effective per-stage config for one sub-stage being inlined.
+
+    Bakes the sub-flow's per-stage settings + its defaults (most specific
+    wins) into a single dict. Built-in defaults are NOT baked — those fall
+    through to the parent's `_resolve_config` so a parent default can still
+    fill an unset key.
+
+    See DESIGN.md "Sub-flow autonomy" for the rationale.
+    """
+    per_stage = subflow._stage_config.get(sub_name, {})
+    sub_defaults = subflow._default_config
+    effective: dict[str, Any] = {}
+    for key in ("scaling", "queue", "queue_size"):
+        if key in per_stage:
+            effective[key] = per_stage[key]
+        elif key in sub_defaults:
+            effective[key] = sub_defaults[key]
+    return effective
+
+
+@dataclass
 class _StageRuntime:
     """Per-stage runtime state for one `_FlowRun`.
 
@@ -767,88 +815,128 @@ class _FlowRun:
 
 
 def flow(
-    *stages: Callable[[Any], Any],
+    *stages: Any,
     default_scaling: ScalingStrategy | None = None,
     default_queue: AsyncQueueFactory | None = None,
     default_queue_size: int | None = None,
     on_error: ErrorHandler | None = None,
 ) -> Flow:
-    """Construct a flow from a sequence of async transformer functions.
+    """Construct a flow from a sequence of stages.
 
-    Each stage must be an async function taking exactly one argument (the
-    item) and returning one item. The last stage acts as the sink — its
-    return value is dropped.
+    Each stage is one of:
+      - 1-arg async function (plain transformer) — called per item
+      - 0-arg callable returning an `AsyncContextManager` (CM factory)
+      - A `Flow` (sub-flow) — its stages are inlined into this flow's graph
+        with names prefixed by `_subflow_N` (or by the explicit prefix from
+        `stage(inner, name="...")`)
+      - `stage(target, name="...")` — wraps any of the above with an
+        explicit name override
 
-    The optional `default_*` kwargs are shorthand for calling
-    `configure_default(...)` on the resulting Flow.
+    The last stage acts as the sink when run autonomously — its return
+    value is dropped.
 
-    Validation rules (per DESIGN.md):
-    - Async generators are rejected — they are sources, not stages, and
-      belong to `run()`.
-    - Sync functions are rejected — wrap with `asyncio.to_thread` or
-      `sync_stage()` (planned).
-    - Each stage must take exactly one argument.
+    Optional `default_*` kwargs are shorthand for `configure_default(...)`.
 
-    Stage names are auto-derived from function names; collisions get a
-    numeric suffix (`normalize`, `normalize_2`, ...).
+    Validation rules:
+      - Async generators are rejected — they are sources, not stages.
+      - Sync functions are rejected — wrap with `sync_stage()` or
+        `asyncio.to_thread`.
+      - Each transformer must take exactly one argument.
+
+    Stage names auto-derive from function names; collisions get a numeric
+    suffix (`normalize`, `normalize_2`, ...). Sub-flow inlining and
+    autonomy rules: see DESIGN.md "Composition (sub-flows)".
     """
     if not stages:
         raise TypeError("flow() requires at least one stage")
 
-    # Validate each stage and normalise to (name, factory) tuples.
-    # Two accepted shapes:
-    #   - 1-arg async function — plain transformer; wrapped to factory shape
-    #   - 0-arg callable (function or class) — CM factory; used as-is
-    normalised: list[tuple[str, StageFactory]] = []
-    for stage in stages:
-        if inspect.isasyncgenfunction(stage):
+    # Phase 1: walk args, expand sub-flows, collect raw items.
+    # Each entry: (base_name, factory, inlined_config_or_None).
+    raw_items: list[tuple[str, StageFactory, dict[str, Any] | None]] = []
+    subflow_counter = 0
+
+    for arg in stages:
+        # Unwrap stage(target, name=...) wrapper
+        if isinstance(arg, _NamedStage):
+            explicit_name = arg.name
+            target = arg.target
+        else:
+            explicit_name = None
+            target = arg
+
+        # Sub-flow: inline its stages with prefixed names + resolved config
+        if isinstance(target, Flow):
+            prefix = (
+                explicit_name
+                if explicit_name is not None
+                else f"_subflow_{subflow_counter}"
+            )
+            subflow_counter += 1
+            for sub_name, sub_factory in target._stages:
+                effective = _resolve_subflow_stage_config(target, sub_name)
+                raw_items.append(
+                    (f"{prefix}.{sub_name}", sub_factory, effective or None)
+                )
+            continue
+
+        # Plain transformer / CM factory
+        if inspect.isasyncgenfunction(target):
             raise TypeError(
                 f"flow() does not accept async generators "
-                f"(got {stage.__name__!r}); pass sources to run() instead"
+                f"(got {target.__name__!r}); pass sources to run() instead"
             )
-        if not callable(stage):
+        if not callable(target):
             raise TypeError(
-                f"flow() arguments must be callable, got {type(stage).__name__}"
+                f"flow() arguments must be callable or a Flow, got "
+                f"{type(target).__name__}"
             )
 
-        sig = inspect.signature(stage)
+        sig = inspect.signature(target)
         param_count = len(sig.parameters)
-        name = getattr(stage, "__name__", repr(stage))
+        auto_name = getattr(target, "__name__", repr(target))
+        base_name = explicit_name if explicit_name is not None else auto_name
 
         if param_count == 1:
-            # Plain transformer — must be async
-            if not inspect.iscoroutinefunction(stage):
+            if not inspect.iscoroutinefunction(target):
                 raise TypeError(
-                    f"transformer {name!r} is sync; wrap with sync_stage() "
+                    f"transformer {auto_name!r} is sync; wrap with sync_stage() "
                     f"to run it via asyncio.to_thread, or rewrite as async"
                 )
-            factory = _wrap_plain_as_factory(stage)
+            factory = _wrap_plain_as_factory(target)
         elif param_count == 0:
-            # CM factory — function (@asynccontextmanager) or class with
-            # __aenter__ / __aexit__ and a no-arg constructor. We can't
-            # verify the result is a CM until call time; the framework will
-            # raise then if it isn't.
-            factory = stage  # type: ignore[assignment]
+            factory = target  # type: ignore[assignment]
         else:
             raise TypeError(
-                f"stage {name!r} must take 0 args (CM factory) or 1 arg "
+                f"stage {auto_name!r} must take 0 args (CM factory) or 1 arg "
                 f"(transformer); got {param_count}"
             )
 
-        normalised.append((name, factory))
+        raw_items.append((base_name, factory, None))
 
-    # Auto-name with collision suffix (uses original name from above).
+    # Phase 2: collision-suffix names
     counts: dict[str, int] = {}
-    named: list[tuple[str, StageFactory]] = []
-    for base_name, factory in normalised:
+    final_items: list[tuple[str, StageFactory, dict[str, Any] | None]] = []
+    for base_name, factory, effective in raw_items:
         counts[base_name] = counts.get(base_name, 0) + 1
-        name = base_name if counts[base_name] == 1 else f"{base_name}_{counts[base_name]}"
-        named.append((name, factory))
+        name = (
+            base_name
+            if counts[base_name] == 1
+            else f"{base_name}_{counts[base_name]}"
+        )
+        final_items.append((name, factory, effective))
 
-    return Flow(
-        stages=named,
+    # Phase 3: construct Flow, then bake inlined sub-flow configs into the
+    # parent's per-stage config map. Parent's later configure() calls
+    # overwrite per key (most-specific wins, per key — not per stage).
+    flow_obj = Flow(
+        stages=[(n, f) for n, f, _ in final_items],
         default_scaling=default_scaling,
         default_queue=default_queue,
         default_queue_size=default_queue_size,
         on_error=on_error,
     )
+    for name, _, effective in final_items:
+        if effective:
+            flow_obj._stage_config[name] = dict(effective)
+
+    return flow_obj
