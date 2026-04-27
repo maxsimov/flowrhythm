@@ -10,7 +10,8 @@ Pipeline DSL for chaining async stages (producer → transformers → sink) with
 - **Coverage:** `make cov`
 - **Lint:** `make lint` (ruff)
 - **Build:** `uv build`
-- **Publish:** `uv publish` — token in 1Password: `Servers / flowrhythm PyPI publish token`. Retrieve via `op read 'op://Servers/flowrhythm PyPI publish token/credential'`. For one-off publish: `UV_PUBLISH_TOKEN=$(op read ...) uv publish`. Account-wide initially; scope to project after first successful publish.
+- **Publish:** `uv publish` — token in 1Password: `Servers / flowrhythm PyPI publish token`. Retrieve via `op read 'op://Servers/flowrhythm PyPI publish token/credential'`. For one-off publish: `UV_PUBLISH_TOKEN=$(op read ...) uv publish`.
+  - **Always tag the release immediately after a successful publish:** `git tag -a vX.Y.Z -m "Release vX.Y.Z — <summary>" && git push --tags`. Tag = the version that's now permanently live on PyPI; the tag pins the exact source state that produced it (essential for tracebacks, bug-bisecting, and reproducing user-reported issues).
 
 ## Architecture
 
