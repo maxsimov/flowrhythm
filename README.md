@@ -21,6 +21,8 @@
 - [Scaling Strategies](#scaling-strategies) — `FixedScaling`, `UtilizationScaling`, custom
 - [Error Handling](#error-handling) — typed events, handler-decides-policy
 - [Driving a flow](#driving-a-flow) — `run`, `push`, `drain`, `stop`; bounded vs unbounded vs push
+- [Inspecting a flow](#inspecting-a-flow) — `dump(mode="structure")` and `dump(mode="stats")`
+- [Troubleshooting](#troubleshooting) — common failure modes; where to look first
 - [Public API](#public-api) — full method and type reference
 - [Guarantees](#guarantees) — what the framework promises, and what it doesn't
 - [Architecture](#architecture) — design principles, component overview, pipeline flow
@@ -839,7 +841,7 @@ flow (5 stages):
 
 Sub-flow stages and router arms appear with dotted names (`dispatch.fast`, `ingest.parse`) — composition is visible at a glance.
 
-For live runtime stats, use `chain.dump(mode="stats")`. Readable both during a run and after it finishes:
+For live runtime stats, use `chain.dump(mode="stats")`. Readable both during a run AND after it finishes:
 
 ```python
 print(chain.dump(mode="stats"))
@@ -856,6 +858,170 @@ print(chain.dump(mode="stats"))
 ```
 
 Per-stage `processed` and `errors` counters plus aggregate event totals. Useful for spotting bottlenecks (look at `queue_length` and `busy`/`idle` ratios) and validating health (`errors` and `drops`). Mermaid format isn't supported for stats (stats aren't graph-shaped).
+
+---
+
+## Troubleshooting
+
+Common failure modes and what to do about them. Each entry is **symptom → why → fix**.
+
+### `TypeError: pass the generator function, not the called generator`
+
+**Symptom:**
+```python
+await chain.run(items())   # raises TypeError
+```
+
+**Why:** The framework owns iteration over your source — that's what lets it close the generator on `drain()`, manage retries, and otherwise control the source lifecycle. A pre-instantiated generator can only be iterated once and from one place; the framework can't hand it back.
+
+**Fix:** Pass the function itself (no parentheses):
+```python
+await chain.run(items)
+```
+
+### `TypeError: transformer 'foo' is sync`
+
+**Symptom:**
+```python
+def foo(x):           # def, not async def
+    return x.upper()
+
+flow(foo)             # raises at construction
+```
+
+**Why:** Sync functions block the event loop, freezing every other stage. The framework rejects them at construction so the failure mode is loud, not silent.
+
+**Fix:** Either rewrite as `async def`, or wrap with `sync_stage()` for code that has to stay sync (CPU-bound work, third-party libs):
+```python
+from flowrhythm import sync_stage
+
+flow(sync_stage(foo))   # runs each call in a thread via asyncio.to_thread
+```
+
+### Items disappear without reaching the sink
+
+**Symptom:** Some inputs never arrive at the last stage. No exception, no obvious error.
+
+**Why:** Items can vanish for several reasons; the framework treats them all as observable events but stays silent unless you set a handler:
+
+| What happened | How to spot it |
+|---|---|
+| Transformer raised; default handler logged to stderr but pipeline continued | Check stderr; or `chain.dump(mode="stats")` shows `errors > 0` and `events.transformer_errors > 0` |
+| Router classifier returned an unknown label and there was no `default` arm | Stats shows `events.drops.ROUTER_MISS > 0` |
+| `Last(value)` fired upstream — items already in flight got cut off | Stats shows `events.drops.UPSTREAM_TERMINATED > 0` |
+| Source generator raised; default handler logged + drained | Stats shows `events.source_errors > 0` |
+
+**Fix:** Set an `on_error` handler so you see what's being dropped:
+
+```python
+async def on_error(event):
+    match event:
+        case TransformerError(item, exc, stage):
+            log.error("stage %s failed on %r: %s", stage, item, exc)
+        case Dropped(item, stage, reason):
+            log.warn("dropped %r at %s: %s", item, stage, reason.name)
+        case SourceError(exc):
+            log.critical("source died: %s", exc)
+
+chain = flow(..., on_error=on_error)
+```
+
+### Pipeline hangs and never returns
+
+**Symptom:** `await chain.run(...)` doesn't return. Source long since exhausted.
+
+**Why:** Almost always a transformer that never finishes — infinite loop, blocking I/O, deadlock on an external lock.
+
+**Fix:** Use a watchdog to dump stats while the run is in progress. Look for stages with high `busy` count that don't change between dumps — those are stuck:
+
+```python
+async def watchdog():
+    while True:
+        await asyncio.sleep(5)
+        print(chain.dump(mode="stats"))
+
+asyncio.create_task(watchdog())
+async with asyncio.timeout(60):    # bound the run while debugging
+    await chain.run(items)
+```
+
+If you can't reproduce it locally, wrap the run in `asyncio.timeout(...)` in production and call `chain.stop()` on timeout — that cancels stuck workers and cleanly runs their resource cleanup (`__aexit__`).
+
+### `Last(value)` isn't actually the last item the sink sees
+
+**Symptom:** You return `Last(value)` from a transformer, but the sink processes items *after* `value`.
+
+**Why:** With multiple workers in a downstream stage, item completion order isn't preserved across workers. The framework guarantees `value` enters the destination *queue* last; with a single-worker downstream that's also the last item *processed*, but with N>1 workers two items can be in flight simultaneously and finish in either order.
+
+**Fix:** Configure the receiving stage with one worker:
+```python
+chain.configure("sink", scaling=FixedScaling(workers=1))
+```
+
+This applies to the stage that consumes `value` — usually the sink, sometimes a single-worker formatting stage right before it.
+
+### `RuntimeError: cannot send() after complete()` in push mode
+
+**Symptom:**
+```python
+async with chain.push() as h:
+    await h.send(1)
+await h.send(2)               # raises RuntimeError
+```
+
+Or:
+```python
+async with chain.push() as h:
+    await h.send(1)
+    await h.complete()
+    await h.send(2)            # raises RuntimeError
+```
+
+**Why:** `complete()` is irreversible — it signals end-of-stream and starts the drain cascade. Exiting the `async with` block calls it automatically.
+
+**Fix:** Keep all `send()` calls inside the `async with` block (or before any explicit `complete()`). The `async with` exit handles `complete()` for you:
+```python
+async with chain.push() as h:
+    for item in source:
+        await h.send(item)
+    # complete() called automatically here
+```
+
+### Worker count stays high under `UtilizationScaling` after load drops
+
+**Symptom:** After a burst of items, `dump(mode="stats")` shows the worker count hasn't shrunk back.
+
+**Why (most common):** Scaling decisions fire on item enqueue/dequeue events. If items stop flowing entirely, no decision happens — the worker count stays at whatever it was. Workers are idle (`waiting on get`) but alive.
+
+**Less common reasons:**
+
+- **Cooldown period.** `UtilizationScaling(cooldown_seconds=5.0)` prevents another scale event within 5 seconds of the last one.
+- **Sampling gates.** If you set `sampling_period` or `sampling_events`, decisions are throttled to those rates.
+- **`min_workers > 0`.** Scaling never goes below `min_workers`. For full scale-to-zero, set `min_workers=0` (and you must use `UtilizationScaling` — `FixedScaling` requires `workers >= 1`).
+
+**Fix:** Check your strategy parameters. To force a scale-down decision, send another item (or use a periodic "tick" trigger). To allow scale-to-zero, use `UtilizationScaling(min_workers=0, ...)`.
+
+### Pipeline doesn't backpressure — memory grows unbounded
+
+**Symptom:** Memory usage grows during long runs even though the sink can keep up.
+
+**Why:** A stage with `queue_size=0` (unbounded) doesn't backpressure — its upstream can push items faster than it processes them. Default queue size is `1` precisely to prevent this. If you've explicitly opted into a larger or unbounded queue, you're trading backpressure for buffering.
+
+**Fix:** Default to small queues and only increase per stage where bursty buffering helps:
+```python
+chain.configure("bursty_stage", queue_size=100)   # explicit, narrow scope
+```
+
+Avoid `queue_size=0` (unbounded) unless you have an external bound on input rate.
+
+### Where to look first
+
+If something's wrong:
+
+1. `chain.dump(mode="structure")` — does the topology match what you wrote? Are stage names what you expected?
+2. `chain.dump(mode="stats")` — are items flowing? Where are they piling up? How many errors / drops?
+3. Set an `on_error` handler if you haven't — silent drops become loud.
+4. Wrap the run in `asyncio.timeout(...)` when debugging hangs, and call `chain.stop()` on timeout to inspect cleanup.
 
 ---
 

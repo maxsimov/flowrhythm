@@ -1,7 +1,7 @@
 # Implement the runtime
 
-**Status:** in-progress
-**Updated:** 2026-04-26
+**Status:** implemented
+**Updated:** 2026-04-27
 
 ## Motivation
 
@@ -267,9 +267,9 @@ See [`todos/dump-implementation.md`](dump-implementation.md) for the broader pla
 
 ## Polish (across milestones)
 
-- [ ] Add a "Troubleshooting" section to README based on real failure modes encountered during implementation and testing — common mistakes (sync code in stages, `flow(items())` instead of `flow(items)`, missing error handler), how to read `dump()` output, what to check when the pipeline stalls. (Deferred from `readme-rewrite.md` because writing this without a runtime to validate against is speculative.)
-- [ ] Verify `make lint` passes (ruff) at every milestone
-- [ ] Verify `make cov` shows reasonable coverage at every milestone
+- [x] Add a "Troubleshooting" section to README — 9 entries covering: called-vs-uncalled generator, sync transformers, silent item disappearance (4 root causes), pipeline hangs, Last-isn't-last, push-mode `complete()` traps, scaling-down lag under UtilizationScaling, missing backpressure with `queue_size=0`. Each entry uses **symptom → why → fix** format with worked examples. Closes with a "where to look first" diagnostic checklist (`dump(structure)` → `dump(stats)` → `on_error` handler → `asyncio.timeout` for hangs). Added to TOC alongside the new "Inspecting a flow" section.
+- [x] `make lint` passes (ruff) at every milestone — verified at every commit; CI runs it too.
+- [x] `make cov` shows reasonable coverage at every milestone — sustained 95%+ throughout M0–M10.
 
 ## Done
 
