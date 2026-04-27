@@ -1,7 +1,7 @@
 # Implement `Flow.dump()`
 
-**Status:** planned
-**Updated:** 2026-04-26
+**Status:** in-progress
+**Updated:** 2026-04-27
 
 ## Motivation
 
@@ -18,18 +18,18 @@ Depends on: `implement-runtime.md` (need the flow graph and stats infrastructure
 
 ### API
 
-- [ ] Implement `Flow.dump(mode="structure")` returning structure representation
-- [ ] Implement `Flow.dump(mode="stats")` returning live runtime stats
-- [ ] Decide and implement output format(s) — see DESIGN.md open question (`JSON`, `mermaid`, plain text, or all three)
+- [x] Implement `Flow.dump(mode="structure")` — see `Flow.dump()` in `_flow.py`. Three formats via `format=` kwarg.
+- [ ] Implement `Flow.dump(mode="stats")` — currently raises `NotImplementedError`; M10.
+- [x] Decide and implement output format(s) — **text + mermaid + json** (settled with user). Sub-flow boundaries are NOT visually marked separately because dotted names already convey the structure (`outer.inner.decode`); router branching IS shown explicitly via arm labels and merge edges.
 
 ### Structure mode
 
-- [ ] Walk the expanded graph (after sub-flow inlining and router expansion)
-- [ ] Show stage names with namespacing (`outer`, `outer.inner.decode`, `outer.split.fast`)
-- [ ] Show queues between stages with type (FIFO/LIFO/priority)
-- [ ] Show scaling strategy per stage (with min/max bounds)
-- [ ] Indicate router branching visually
-- [ ] Indicate sub-flow boundaries visually (so user can see what was a `Flow` before inlining)
+- [x] Walk the expanded graph (after sub-flow inlining and router expansion) — `_stage_info_list()` derives the structured form from `flow._stages` + `flow._resolve_config()`.
+- [x] Show stage names with namespacing — uses the actual stored names which already encode the namespace (sub-flow inlining + `stage(name=)` overrides).
+- [x] Show queues between stages with type — each stage's row includes `<factory>(maxsize=N)`.
+- [x] Show scaling strategy per stage — uses `repr(strategy)`. Added `__repr__` to `FixedScaling` and `UtilizationScaling`.
+- [x] Indicate router branching visually — text format shows `arms: {fast→[3], slow→[4]}`; mermaid uses labeled edges and a diamond node for the classifier.
+- [-] Sub-flow boundaries — not separately marked beyond the dotted names. Adding explicit grouping (e.g., subgraph in mermaid) is deferred — dotted names + dump output already make composition visible.
 
 ### Stats mode
 
@@ -41,17 +41,17 @@ Depends on: `implement-runtime.md` (need the flow graph and stats infrastructure
 
 ### Tests
 
-- [ ] Structure mode for linear flow
-- [ ] Structure mode for sub-flow composition (verify namespaced names)
-- [ ] Structure mode for router (verify arm representation)
+- [x] Structure mode for linear flow — covered in `tests/test_flow_dump.py`.
+- [x] Structure mode for sub-flow composition (verify namespaced names) — covered.
+- [x] Structure mode for router (verify arm representation) — covered for all three formats.
 - [ ] Stats mode while flow is running (verify counters update)
 - [ ] Stats mode after `stop()` / `drain()` (verify final state)
 
 ### Documentation
 
-- [ ] Add a worked example to README — both modes, real output shown
-- [ ] Add a "debugging" subsection mentioning `dump()` as the first thing to try
+- [x] Add a worked example to README — both modes, real output shown.
+- [ ] Add a "debugging" subsection mentioning `dump()` as the first thing to try (deferred to README polish phase).
 
 ## Done
 
-(none yet)
+- M9 — `dump(mode="structure")` shipped with text/mermaid/json formats. 20 tests in `tests/test_flow_dump.py`. `__repr__` added to scaling strategies. DESIGN open question on dump format resolved (all three).

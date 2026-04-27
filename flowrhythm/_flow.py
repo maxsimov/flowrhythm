@@ -483,6 +483,135 @@ class Flow:
         if self._current_run is not None:
             await self._current_run.stop()
 
+    def dump(
+        self, *, mode: str = "structure", format: str = "text"
+    ) -> str:
+        """Inspect the flow.
+
+            print(chain.dump())                       # text, default
+            print(chain.dump(format="mermaid"))       # mermaid graph
+            data = json.loads(chain.dump(format="json"))
+
+        `mode="structure"` renders the expanded pipeline graph (stages,
+        scaling, queue config, router branches). `mode="stats"` will be
+        added in M10.
+        """
+        if mode == "structure":
+            return _dump_structure(self, format)
+        if mode == "stats":
+            raise NotImplementedError(
+                "dump(mode='stats') is not implemented yet (M10)"
+            )
+        raise ValueError(
+            f"unknown mode {mode!r}; expected 'structure' or 'stats'"
+        )
+
+
+def _stage_info_list(flow: "Flow") -> list[dict[str, Any]]:
+    """Compute a structured per-stage info list from a Flow's expanded
+    `_stages`. Used by all three dump formats so they share one
+    derivation of topology + config."""
+    n = len(flow._stages)
+    out: list[dict[str, Any]] = []
+    for i, (name, _factory, hint) in enumerate(flow._stages):
+        cfg = flow._resolve_config(name)
+        info: dict[str, Any] = {
+            "index": i,
+            "name": name,
+            "scaling": repr(cfg["scaling"]),
+            "queue": {
+                "factory": cfg["queue"].__name__,
+                "maxsize": cfg["queue_size"],
+            },
+        }
+        if isinstance(hint, _ClassifierHint):
+            info["kind"] = "classifier"
+            info["arms"] = dict(hint.arm_first_stage_idx)
+            info["default"] = hint.default_first_stage_idx
+            info["downstream"] = None
+        elif isinstance(hint, _ArmEndHint):
+            info["kind"] = "arm-end"
+            merge = hint.merge_stage_idx if hint.merge_stage_idx >= 0 else None
+            info["merge"] = merge
+            info["downstream"] = merge
+        else:
+            info["kind"] = "transformer"
+            info["downstream"] = i + 1 if i + 1 < n else None
+        out.append(info)
+    return out
+
+
+def _dump_structure(flow: "Flow", fmt: str) -> str:
+    info = _stage_info_list(flow)
+    if fmt == "text":
+        return _render_text(info)
+    if fmt == "mermaid":
+        return _render_mermaid(info)
+    if fmt == "json":
+        import json as _json
+        return _json.dumps({"stages": info}, indent=2)
+    raise ValueError(
+        f"unknown format {fmt!r}; expected 'text', 'mermaid', or 'json'"
+    )
+
+
+def _render_text(info: list[dict[str, Any]]) -> str:
+    lines = [f"flow ({len(info)} stages):"]
+    # Compute column widths for alignment
+    name_w = max((len(s["name"]) for s in info), default=4) + 2
+    for s in info:
+        idx = f"[{s['index']}]"
+        # Build the "kind" tag
+        if s["kind"] == "classifier":
+            kind_tag = " [classifier]"
+        elif s["kind"] == "arm-end":
+            kind_tag = " (arm-end)"
+        else:
+            kind_tag = ""
+        name_col = f"{s['name']}{kind_tag}".ljust(name_w + 13)
+        # Build the destination column
+        if s["kind"] == "classifier":
+            arms_str = ", ".join(
+                f"{label}→[{idx_}]" for label, idx_ in s["arms"].items()
+            )
+            if s["default"] is not None:
+                arms_str += f", default→[{s['default']}]"
+            dest = f"arms: {{{arms_str}}}"
+        elif s["downstream"] is None:
+            dest = "(sink)"
+        else:
+            dest = f"→ [{s['downstream']}]"
+            if s["kind"] == "arm-end":
+                dest += " (merge)"
+        # Config column
+        scaling = s["scaling"]
+        q = s["queue"]
+        cfg = f"{scaling} {q['factory']}(maxsize={q['maxsize']})"
+        lines.append(f"  {idx} {name_col} {dest:30s} {cfg}")
+    return "\n".join(lines)
+
+
+def _render_mermaid(info: list[dict[str, Any]]) -> str:
+    lines = ["flowchart LR"]
+    # Node declarations: classifiers as diamond {}, others as box []
+    for s in info:
+        node_id = f"s{s['index']}"
+        if s["kind"] == "classifier":
+            lines.append(f"    {node_id}{{{s['name']}}}")
+        else:
+            lines.append(f"    {node_id}[{s['name']}]")
+    # Edges
+    for s in info:
+        node_id = f"s{s['index']}"
+        if s["kind"] == "classifier":
+            for label, target in s["arms"].items():
+                lines.append(f"    {node_id} -->|{label}| s{target}")
+            if s["default"] is not None:
+                lines.append(f"    {node_id} -->|default| s{s['default']}")
+        elif s["downstream"] is not None:
+            lines.append(f"    {node_id} --> s{s['downstream']}")
+    return "\n".join(lines)
+
 
 class PushHandle:
     """Handle for pushing items into a flow activated via `Flow.push()`.

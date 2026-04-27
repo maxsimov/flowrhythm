@@ -804,6 +804,43 @@ Exiting the `async with chain.push() as h:` block automatically calls `h.complet
 
 ---
 
+## Inspecting a flow
+
+`chain.dump()` renders the expanded pipeline graph for debugging. Three formats:
+
+```python
+print(chain.dump())                       # text (default)
+print(chain.dump(format="mermaid"))       # paste into a markdown file
+data = json.loads(chain.dump(format="json"))
+```
+
+For a flow like:
+
+```python
+chain = flow(
+    parse,
+    validate,
+    stage(router(classify, fast=fast, slow=heavy_path), name="dispatch"),
+    db_write,
+)
+```
+
+`chain.dump()` shows:
+
+```
+flow (5 stages):
+  [0] parse                              → [1]                          FixedScaling(workers=1) fifo_queue(maxsize=1)
+  [1] validate                           → [2]                          FixedScaling(workers=1) fifo_queue(maxsize=1)
+  [2] dispatch [classifier]              arms: {fast→[3], slow→[4]}     FixedScaling(workers=1) fifo_queue(maxsize=1)
+  [3] dispatch.fast (arm-end)            → [5] (merge)                  FixedScaling(workers=1) fifo_queue(maxsize=1)
+  [4] dispatch.slow (arm-end)            → [5] (merge)                  FixedScaling(workers=1) fifo_queue(maxsize=1)
+  [5] db_write                           (sink)                         FixedScaling(workers=1) fifo_queue(maxsize=1)
+```
+
+Sub-flow stages and router arms appear with dotted names (`dispatch.fast`, `ingest.parse`) — composition is visible at a glance. `chain.dump(mode="stats")` for live runtime stats is planned (M10).
+
+---
+
 ## Public API
 
 ### Construction
@@ -836,7 +873,7 @@ Exiting the `async with chain.push() as h:` block automatically calls `h.complet
 | `flow.configure(name, scaling=..., queue=..., queue_size=...)` | Per-stage tuning. `queue=` is a queue factory (`fifo_queue`, `priority_queue`, …); `queue_size=` is the queue's `maxsize`. Either or both may be set independently. |
 | `flow.configure_default(scaling=..., queue=..., queue_size=...)` | Pipeline-wide defaults; same kwargs as `configure()` |
 | `flow.set_error_handler(handler)` | Set the error sink for uncaught transformer exceptions |
-| `flow.dump(mode=...)` | Inspect the flow. `mode="structure"` renders the pipeline layout; `mode="stats"` renders live runtime stats |
+| `flow.dump(mode="structure", format="text"\|"mermaid"\|"json")` | Inspect the flow. `mode="structure"` renders the pipeline graph (text for terminals, mermaid for docs/markdown, JSON for tooling). `mode="stats"` renders live runtime stats *(planned)*. |
 
 ### Types and helpers
 

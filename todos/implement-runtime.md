@@ -240,10 +240,14 @@ Last(value) in router topology resolved:
 
 Goal: introspect the pipeline graph for debugging.
 
-- [ ] Walk the expanded graph (after sub-flow + router expansion)
-- [ ] Render: stage names with namespacing (`outer`, `outer.inner.decode`); queue type per stage; scaling strategy (with min/max); router branches; sub-flow boundaries
-- [ ] Choose output format (decide: text, JSON, mermaid, or all three — see DESIGN.md open question)
-- [ ] Tests: structure for linear flow, sub-flow composition, router
+- [x] Walk the expanded graph (after sub-flow + router expansion) — `_stage_info_list(flow)` derives a structured per-stage info list from `flow._stages` + `_resolve_config`. Single source of truth used by all three render functions.
+- [x] Render — stage names use stored namespaced names (already encode sub-flow + router prefixes); queue type per stage shown as `<factory>(maxsize=N)`; scaling shown via `repr()` (added `__repr__` to `FixedScaling` and `UtilizationScaling`); router branches shown as labeled arrows in mermaid + arms map in text/JSON.
+- [x] Output formats — **text + mermaid + json** (settled with user). API: `chain.dump(mode="structure", format="text"|"mermaid"|"json")`. Default: structure + text. DESIGN open question on dump format closed.
+- [x] Tests (`tests/test_flow_dump.py` — 20 tests): default + format kwarg behaviour; text content checks (linear, scaling/queue display, router arms, default arm, sub-flow dotted names, arm-end merge marker); mermaid content checks (flowchart LR, labeled arms, merge convergence); JSON schema (linear, router, default, scaling repr); `mode="stats"` raises `NotImplementedError` (M10 placeholder).
+
+Coverage: 95%. 187 tests pass; lint clean.
+
+See [`todos/dump-implementation.md`](dump-implementation.md) for the broader plan covering both M9 (done) and M10 (stats mode).
 
 ### M10 — `dump(mode="stats")` + worker-state tracking
 

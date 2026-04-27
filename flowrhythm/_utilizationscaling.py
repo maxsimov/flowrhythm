@@ -91,3 +91,9 @@ class UtilizationScaling:
             return -n_remove
 
         return 0
+
+    def __repr__(self) -> str:
+        return (
+            f"UtilizationScaling(min_workers={self.min_workers}, "
+            f"max_workers={self.max_workers})"
+        )

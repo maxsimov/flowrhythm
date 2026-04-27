@@ -680,7 +680,6 @@ Without this invariant, the first arm-end to finish would shut down the merge qu
 
 - **`configure()` validation** — warn if user configures a stage name that doesn't exist in the flow?
 - **Multi-source producers** — single worker per producer is decided. If a user needs multi-source ingestion, do they merge upstream (router-style), run multiple flows, or do we add parallel producers?
-- **`dump()` output format** — JSON, mermaid, plain text, or all three?
 - **Per-stage error handling** — currently pipeline-only. Useful to override per stage, or keep simple?
 
 ## Future enhancements (deferred)

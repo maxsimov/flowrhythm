@@ -77,3 +77,6 @@ class FixedScaling:
 
     def on_dequeue(self, stats: StageSnapshot) -> int:
         return 0  # never scales
+
+    def __repr__(self) -> str:
+        return f"FixedScaling(workers={self.workers})"
