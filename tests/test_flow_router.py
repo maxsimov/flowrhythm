@@ -393,6 +393,120 @@ async def test_router_arm_with_nested_router_inner_has_merge():
 
 
 # ---------------------------------------------------------------------------
+# Path tracing: explicit per-item breadcrumb through complex topology
+# ---------------------------------------------------------------------------
+
+
+async def test_router_path_tracing_through_nested_topology():
+    """Verify the EXACT path each item takes through a complex DAG.
+
+    Output-value assertions only prove an item reached the sink with the
+    right transformation; they don't prove HOW it got there. This test
+    instruments every stage to append its name to a per-item breadcrumb,
+    so we can pin down: classifier saw the item, exactly one arm
+    processed it, no leakage to sibling arms, no duplicate visits, and
+    the order of visits matches the topology.
+
+    Topology (outer router with sub-flow arm; inner router has its own
+    merge stage):
+
+        items → preprocess → router_outer ─┬─ fast ───────────────────────► collect
+                                           └─ slow:                        ▲
+                                              router_inner ─┬─ big ─┐      │
+                                                            └─ huge ┘      │
+                                                                  → tag_inner
+    """
+    received: list[dict] = []
+
+    async def items():
+        for v in [1, 100, 9999]:
+            yield {"id": v, "value": v, "trail": []}
+
+    async def preprocess(item):
+        item["trail"].append("preprocess")
+        return item
+
+    async def cls_outer(item):
+        item["trail"].append("cls_outer")
+        return "slow" if item["value"] >= 100 else "fast"
+
+    async def fast(item):
+        item["trail"].append("fast")
+        return item
+
+    async def cls_inner(item):
+        item["trail"].append("cls_inner")
+        return "huge" if item["value"] >= 1000 else "big"
+
+    async def big(item):
+        item["trail"].append("big")
+        return item
+
+    async def huge(item):
+        item["trail"].append("huge")
+        return item
+
+    async def tag_inner(item):
+        item["trail"].append("tag_inner")
+        return item
+
+    async def collect(item):
+        item["trail"].append("collect")
+        received.append(item)
+
+    inner = flow(
+        stage(router(cls_inner, big=big, huge=huge), name="r_inner"),
+        tag_inner,
+    )
+    chain = flow(
+        preprocess,
+        stage(router(cls_outer, fast=fast, slow=inner), name="r_outer"),
+        collect,
+    )
+
+    await chain.run(items)
+
+    # Every item arrived at the sink, exactly once
+    assert len(received) == 3
+    by_id = {item["id"]: item for item in received}
+    assert set(by_id.keys()) == {1, 100, 9999}
+
+    # EXACT path per item — proves both positive (visited expected stages
+    # in expected order) and negative (no extra visits) properties.
+    assert by_id[1]["trail"] == [
+        "preprocess",
+        "cls_outer",
+        "fast",
+        "collect",
+    ]
+    assert by_id[100]["trail"] == [
+        "preprocess",
+        "cls_outer",
+        "cls_inner",
+        "big",
+        "tag_inner",
+        "collect",
+    ]
+    assert by_id[9999]["trail"] == [
+        "preprocess",
+        "cls_outer",
+        "cls_inner",
+        "huge",
+        "tag_inner",
+        "collect",
+    ]
+
+    # Negative assertions — items must NOT have visited sibling-arm stages.
+    # (Already implied by the exact-trail asserts above, but stating them
+    # explicitly documents the topology contract.)
+    assert "fast" not in by_id[100]["trail"]
+    assert "fast" not in by_id[9999]["trail"]
+    assert "cls_inner" not in by_id[1]["trail"]
+    assert "huge" not in by_id[100]["trail"]
+    assert "big" not in by_id[9999]["trail"]
+
+
+# ---------------------------------------------------------------------------
 # Public API exports
 # ---------------------------------------------------------------------------
 
