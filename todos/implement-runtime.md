@@ -226,8 +226,15 @@ Coverage: 95% overall (93% on `_flow.py`). 134 tests pass in 0.10s. `make lint` 
 
 M8.5 follow-up (same milestone, immediate fix): nested routers in arm Flows are now supported. The arm-Flow expander identifies all *terminal* stages (the inner Flow's last stage if hint=None, OR all inner-arm-ends with merge=-1 if the inner router was the last thing in the arm Flow) and promotes each to an outer arm-end. Two cases tested: inner router with no inner merge (multi-terminal); inner router with its own merge stage (single-terminal). The `NotImplementedError` guard was removed.
 
-Deferred to a later milestone:
-- Last(value) inside a router arm — works for the linear cascade but the upstream-kill semantics across multiple arms is untested; document as gray area
+Test review follow-up (M8.6): added 8 high-value tests covering router-as-last-stage, sequential routers (with path-tracing), CM-factory arms, classifier raises, arm raises, drain mid-flight, stop with CM cleanup, and per-item path-tracing through nested topology. Plus 2 tests for the Last-in-router resolution below. All passed first run.
+
+`_DISPATCHED` sentinel removed (was redundant with `downstream_stage_idx=None`).
+
+Last(value) in router topology resolved:
+- `_handle_last` generalised to use `downstream_stage_idx` as the kill boundary. For arm-end stages this means killing the classifier AND every sibling arm before propagating. Polling-based wait replaces the per-stage `last_cascade_event` mechanism (simpler, unified across linear and router cases). Invariant I10 updated.
+- A classifier returning `Last(...)` is rejected with `TypeError` (routed via the observer handler as `TransformerError`). Classifiers must return labels.
+
+144 tests pass; 95% coverage; lint clean.
 
 ### M9 — `dump(mode="structure")`
 

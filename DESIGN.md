@@ -54,6 +54,7 @@ No special timing logic, no rate config. Users who want different behavior have 
 - Arms can be plain async functions, CM factories, or `Flow` sub-pipelines — each gets its own input queue and worker pool
 - All arm outputs converge into the same merge queue (the stage right after the router in the parent)
 - If the classifier returns a label with no matching arm and no `default`, the item is dropped and the error handler receives a `Dropped(reason=DropReason.ROUTER_MISS)` event (observer-only — pipeline continues)
+- A classifier returning `Last(value)` is rejected with `TypeError` (routed to the handler as a `TransformerError`). Classifiers must return labels, not termination markers; to terminate from within a router, the corresponding arm transformer should return `Last(value)`, or call `Flow.stop()` externally.
 - Nested routers are supported: an arm can be a `Flow` containing another router. The inner router's terminal stages (its merge stage, or its arm-ends if no inner merge) become the outer arm's "ends" feeding the outer merge.
 
 ### Composability
@@ -627,12 +628,19 @@ Every item that enters the chain reaches a terminal state — consumed by the si
 
 Backs README guarantee: *"Every item that enters the chain reaches a terminal state."*
 
-### I10 — `Last(value)` ordering
+### I10 — `Last(value)` ordering (topology-aware)
 
-When a transformer at stage i returns `Last(value)`:
-- All in-flight sibling-worker results in stage i enter stage i+1's queue first (siblings finish their current item naturally before the cascade fires).
-- `value` enters stage i+1's queue last — no item from stage i appears after it.
-- No item upstream of stage i reaches stage i+1; those items are dropped with `DropReason.UPSTREAM_TERMINATED`.
+When a transformer at stage `i` returns `Last(value)`, the runtime computes the **kill range** as `[0, downstream_stage_idx)` — where `downstream_stage_idx` is `i+1` for normal stages, the merge index for arm-end stages, or `_n` if `i` is the last stage in the pipeline.
+
+The cascade then:
+- Shuts down every queue in the kill range — for routers this includes the classifier AND every sibling arm, not just the firing arm. Items still upstream are dropped (with `DropReason.UPSTREAM_TERMINATED` for source items).
+- Cancels idle workers in stage `i` (state 3 — safe). Sibling arms' idle workers wake from `QueueShutDown` from the same shutdown call.
+- Polls until every stage in the kill range has fully drained (alive == 0 for non-self stages; alive == 1 for the initiator).
+- Puts `value` into the destination queue (`downstream_stage_idx`'s queue), or drops it if `downstream_stage_idx` is None.
+
+Result: `value` is the last item to enter the destination queue. With a single-worker downstream, it is the last item the downstream processes. With multi-worker downstream, per-worker ordering isn't guaranteed (same caveat as elsewhere — see "Across multi-worker stages, order is not preserved").
+
+For Last from inside a router arm, this guarantees no sibling-arm items can sneak past `value` into the merge queue.
 
 Backs README guarantee: *"`Last(value)` is final."*
 

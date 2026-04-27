@@ -297,10 +297,6 @@ class _StageRuntime:
     input_drained: bool = False
     all_workers: set[asyncio.Task] = field(default_factory=set)
     idle_workers: set[asyncio.Task] = field(default_factory=set)
-    # Set by a worker that returned `Last(value)` to signal "wake me when
-    # alive drops to 1 (only I remain) — then I'll propagate the value".
-    # Other workers' `finally` blocks set this when alive == 1.
-    last_cascade_event: asyncio.Event | None = None
 
     # --- Topology (M8: router support) ---
     # Index of the destination stage in `_FlowRun._stages`. None = sink (no
@@ -659,49 +655,65 @@ class _FlowRun:
     async def _handle_last(self, stage_idx: int, last_value: Any) -> None:
         """Initiate the Last(value) cascade.
 
-        Steps (per DESIGN.md "Termination"):
-          1. Kill upstream — shutdown queues 0..stage_idx so source and
-             upstream stages stop feeding new items. This stage's own input
-             queue is included so sibling workers blocked on `get()` see
-             QueueShutDown.
-          2. Cancel idle sibling workers (those in `idle_workers`) in
-             stage_idx. Cancelling busy workers would lose in-flight items;
-             we let them finish naturally.
-          3. Wait until all siblings have exited (this worker is the only
-             one left alive in stage_idx). Sibling exits drive `alive`
-             down; the last sibling out signals `last_cascade_event`.
-          4. Propagate `last_value` to the downstream queue. By this point,
-             all sibling results have already been put — `last_value` is
-             the absolute last item to enter queue[stage_idx + 1].
+        Topology-aware: the kill boundary is `downstream_stage_idx` (the
+        merge for arm-end stages, `stage_idx + 1` for normal stages, or
+        `_n` if the firing stage is the last in the pipeline).
+
+        Steps:
+          1. Shutdown every queue in `[0, downstream_stage_idx)` so all
+             upstream paths stop feeding the destination — for routers
+             this includes the classifier AND every sibling arm, not just
+             the firing arm.
+          2. Cancel idle workers in `stage_idx` (state 3 — safe). Sibling
+             arms' idle workers wake on `QueueShutDown` from the same
+             shutdown call; cancelling them too is unnecessary.
+          3. Poll until every stage in the kill range has fully drained
+             (alive == 0 for non-self stages; alive == 1 for self — just
+             this initiator left). `await asyncio.sleep(0)` yields one
+             event-loop tick per iteration so worker finally blocks can
+             run and decrement `alive`.
+          4. Put `last_value` to the downstream queue. By this point all
+             upstream items have flowed through, so `last_value` is the
+             last item to enter `downstream_stage_idx`'s queue.
         """
         s = self._stages[stage_idx]
         my_task = asyncio.current_task()
+        # If `s.downstream_stage_idx` is None (sink), the kill range is
+        # everything before the sink — i.e., `[0, _n)`.
+        end_exclusive = (
+            s.downstream_stage_idx
+            if s.downstream_stage_idx is not None
+            else self._n
+        )
 
-        # Step 1: kill upstream (queues 0..stage_idx inclusive)
-        for i in range(stage_idx + 1):
+        # Step 1: kill every upstream path that could feed the destination.
+        for i in range(end_exclusive):
             try:
                 self._stages[i].queue.shutdown(immediate=False)  # type: ignore[attr-defined]
             except Exception:
                 pass  # already shut down
             self._stages[i].input_drained = True
 
-        # Step 2: cancel idle siblings in this stage
+        # Step 2: cancel idle siblings in MY stage. (Other stages' idle
+        # workers wake on `QueueShutDown` from step 1 — no extra cancel
+        # needed.)
         for sibling in list(s.idle_workers):
             if sibling is not my_task:
                 sibling.cancel()
 
-        # Step 3: wait for siblings to exit (busy ones finish their item;
-        # idle ones are now cancelled). When alive drops to 1 (just me),
-        # last_cascade_event fires from the last sibling's `finally`.
-        if s.alive > 1:
-            s.last_cascade_event = asyncio.Event()
-            try:
-                await s.last_cascade_event.wait()
-            finally:
-                s.last_cascade_event = None
+        # Step 3: poll until the kill range has fully drained.
+        while True:
+            done = True
+            for i in range(end_exclusive):
+                expected = 1 if i == stage_idx else 0
+                if self._stages[i].alive > expected:
+                    done = False
+                    break
+            if done:
+                break
+            await asyncio.sleep(0)
 
-        # Step 4: propagate last_value as the final item entering downstream.
-        # Uses topology-aware downstream (handles arm-end → merge correctly).
+        # Step 4: put last_value to the downstream queue (if any).
         downstream_idx = s.downstream_stage_idx
         if downstream_idx is not None:
             downstream = self._stages[downstream_idx]
@@ -871,6 +883,14 @@ class _FlowRun:
 
         async def dispatch(item: Any) -> None:
             label = await classifier_fn(item)
+            if isinstance(label, Last):
+                # Classifiers must return a label, not Last. To terminate
+                # the pipeline, return a label and have the corresponding
+                # arm return Last(value), or call Flow.stop() externally.
+                raise TypeError(
+                    f"router classifier {router_name!r} returned "
+                    f"Last(value); classifiers must return a label string"
+                )
             if label in arm_first_stage_idx:
                 target_idx = arm_first_stage_idx[label]
             elif default_idx is not None:
@@ -1037,15 +1057,12 @@ class _FlowRun:
         finally:
             s.all_workers.discard(my_task)
             s.alive -= 1
-            # If a Last() cascade is in progress in this stage, signal the
-            # waiting worker once we (a sibling) have exited, leaving only
-            # the cascade-initiator alive.
-            if s.last_cascade_event is not None and s.alive == 1:
-                s.last_cascade_event.set()
             # Drain cascade: only fire downstream shutdown when this stage is
             # fully drained (its input was shut down upstream and we're the
             # last worker out). Voluntary retirement (target shrunk) doesn't
             # trigger cascade because the source / upstream is still running.
+            # Any in-progress Last cascade is awaiting via polling — see
+            # `_handle_last`; the alive decrement above is what advances it.
             self._maybe_cascade(stage_idx)
             self._check_done()
 

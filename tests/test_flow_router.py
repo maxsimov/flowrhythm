@@ -803,6 +803,86 @@ async def test_stop_runs_arm_worker_cleanup():
 
 
 # ---------------------------------------------------------------------------
+# Last(value) inside a router
+# ---------------------------------------------------------------------------
+
+
+async def test_last_from_arm_value_is_absolute_last_at_sink():
+    """Last(value) returned by an arm worker: the cascade kills the
+    classifier AND every sibling arm before propagating value to the
+    merge queue. Items from sibling arms must NOT arrive at sink AFTER
+    the Last value."""
+    import asyncio
+    from flowrhythm import Last
+
+    sink_received = []
+
+    async def classify(x):
+        return "fast" if x % 2 == 0 else "slow"
+
+    async def fast(x):
+        if x == 0:
+            return Last("FINAL")
+        return f"fast-{x}"
+
+    async def slow(x):
+        return f"slow-{x}"
+
+    async def collect(x):
+        sink_received.append(x)
+
+    chain = flow(router(classify, fast=fast, slow=slow), collect)
+    chain.configure("collect", scaling=FixedScaling(workers=1))
+
+    async def items():
+        for i in range(20):
+            yield i
+
+    async with asyncio.timeout(2):
+        await chain.run(items)
+
+    # FINAL must be present and must be the last item the (single-worker)
+    # sink received — the framework guarantees Last is the absolute last
+    # item to enter the merge queue, regardless of router topology.
+    assert "FINAL" in sink_received
+    assert sink_received[-1] == "FINAL"
+
+
+async def test_last_from_classifier_raises_via_handler():
+    """A classifier returning Last(...) is incoherent — Last belongs to
+    transformers (which return values that flow downstream), not
+    classifiers (which return labels). Reject with TypeError; the
+    observer-only handler logs it."""
+    from flowrhythm import Last, TransformerError
+
+    events = []
+
+    async def on_error(event):
+        events.append(event)
+
+    async def boom_classify(x):
+        return Last("oops")
+
+    async def fn_a(x):
+        pass
+
+    chain = flow(
+        stage(router(boom_classify, a=fn_a), name="my_router"),
+        on_error=on_error,
+    )
+
+    async def items():
+        yield 1
+
+    await chain.run(items)
+    assert len(events) == 1
+    assert isinstance(events[0], TransformerError)
+    assert events[0].stage == "my_router"
+    assert isinstance(events[0].exception, TypeError)
+    assert "Last" in str(events[0].exception)
+
+
+# ---------------------------------------------------------------------------
 # Public API exports
 # ---------------------------------------------------------------------------
 
