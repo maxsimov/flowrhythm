@@ -54,7 +54,7 @@ No special timing logic, no rate config. Users who want different behavior have 
 - Arms can be plain async functions, CM factories, or `Flow` sub-pipelines — each gets its own input queue and worker pool
 - All arm outputs converge into the same merge queue (the stage right after the router in the parent)
 - If the classifier returns a label with no matching arm and no `default`, the item is dropped and the error handler receives a `Dropped(reason=DropReason.ROUTER_MISS)` event (observer-only — pipeline continues)
-- Nested routers inside a router arm are not yet supported (M8 limitation; raises `NotImplementedError` at construction)
+- Nested routers are supported: an arm can be a `Flow` containing another router. The inner router's terminal stages (its merge stage, or its arm-ends if no inner merge) become the outer arm's "ends" feeding the outer merge.
 
 ### Composability
 - A `Flow` plugs into another `flow()` as a stage

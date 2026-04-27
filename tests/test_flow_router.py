@@ -318,24 +318,78 @@ async def test_subflow_containing_router_inlined_as_subflow():
     assert sorted(received) == [20, 1005]
 
 
-async def test_router_arm_with_nested_router_raises():
-    """Using a Flow that contains a router as a router arm is not yet
-    supported (M8 limitation); raises NotImplementedError with a clear hint."""
-    import pytest
+async def test_router_arm_with_nested_router_no_inner_merge():
+    """A Flow used as a router arm CAN itself contain a router. Case 1: the
+    inner router is the only/last thing in the inner Flow, so the inner
+    arm-ends become the outer arm-ends (multiple terminals)."""
+    received = []
 
     async def cls_outer(x):
-        return "a"
+        # 'big' (>= 100) → goes to slow (which has its own router)
+        # otherwise → fast
+        return "slow" if x >= 100 else "fast"
 
     async def cls_inner(x):
-        return "x"
+        # within slow: 'huge' (>= 1000) → huge_path; else → big_path
+        return "huge" if x >= 1000 else "big"
 
-    async def x(x):
-        pass
+    async def fast(x):
+        return x  # passthrough
 
-    inner_with_router = flow(router(cls_inner, x=x))
+    async def big_path(x):
+        return x + 10000
 
-    with pytest.raises(NotImplementedError, match="nested"):
-        flow(router(cls_outer, a=inner_with_router))
+    async def huge_path(x):
+        return x + 100000
+
+    async def collect(x):
+        received.append(x)
+
+    inner = flow(router(cls_inner, big=big_path, huge=huge_path))
+    chain = flow(router(cls_outer, fast=fast, slow=inner), collect)
+
+    async def items():
+        yield 1  # fast → 1
+        yield 100  # slow → big → 100 + 10000 = 10100
+        yield 9999  # slow → huge → 9999 + 100000 = 109999
+
+    await chain.run(items)
+    assert sorted(received) == [1, 10100, 109999]
+
+
+async def test_router_arm_with_nested_router_inner_has_merge():
+    """Case 2: the inner router has its own merge stage inside the arm Flow.
+    Items pass through inner classifier → inner arm → inner merge → outer
+    arm-end → outer merge."""
+    received = []
+
+    async def cls_outer(x):
+        return "main"
+
+    async def cls_inner(x):
+        return "even" if x % 2 == 0 else "odd"
+
+    async def even(x):
+        return x * 2
+
+    async def odd(x):
+        return x + 1
+
+    async def inner_collect(x):
+        return ("inner", x)  # tag at inner merge
+
+    async def collect(x):
+        received.append(x)
+
+    inner = flow(router(cls_inner, even=even, odd=odd), inner_collect)
+    chain = flow(router(cls_outer, main=inner), collect)
+
+    async def items():
+        yield 2  # even → 4 → ("inner", 4)
+        yield 5  # odd → 6 → ("inner", 6)
+
+    await chain.run(items)
+    assert sorted(received) == [("inner", 4), ("inner", 6)]
 
 
 # ---------------------------------------------------------------------------

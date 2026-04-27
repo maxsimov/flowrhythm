@@ -222,10 +222,11 @@ Goal: `router(classifier, **arms, default=None)` works as a graph-fragment stage
 - [x] ROUTER_MISS → `Dropped(item, stage=router_name, reason=DropReason.ROUTER_MISS)` via the existing observer-only handler.
 - [x] Tests (`tests/test_flow_router.py` — 14 tests): basic dispatch by label; outputs flow to next stage; default arm catches unknown labels; ROUTER_MISS event emitted; Flow as arm (sub-flow inlining inside arm); explicit + fallback naming; two unwrapped routers get distinct indices; per-arm config; classifier validation (no arms, sync); sub-flow with router used as sub-flow (re-indexer); nested router in arm raises; `Router`/`router` exported.
 
-Coverage: 95% overall (93% on `_flow.py`). 133 tests pass in 0.10s. `make lint` clean.
+Coverage: 95% overall (93% on `_flow.py`). 134 tests pass in 0.10s. `make lint` clean.
+
+M8.5 follow-up (same milestone, immediate fix): nested routers in arm Flows are now supported. The arm-Flow expander identifies all *terminal* stages (the inner Flow's last stage if hint=None, OR all inner-arm-ends with merge=-1 if the inner router was the last thing in the arm Flow) and promotes each to an outer arm-end. Two cases tested: inner router with no inner merge (multi-terminal); inner router with its own merge stage (single-terminal). The `NotImplementedError` guard was removed.
 
 Deferred to a later milestone:
-- Nested routers in arm Flows (currently raises `NotImplementedError` with a clear hint)
 - Last(value) inside a router arm — works for the linear cascade but the upstream-kill semantics across multiple arms is untested; document as gray area
 
 ### M9 — `dump(mode="structure")`

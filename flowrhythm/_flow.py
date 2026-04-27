@@ -1164,32 +1164,70 @@ def flow(
 
                 # Arm can be a Flow (sub-flow inlining) or a callable.
                 if isinstance(arm_target, Flow):
-                    # M8 limitation: nested routers (router-inside-arm-Flow)
-                    # are not yet supported because the inner router's
-                    # arm-end last stage would clash with the outer arm's
-                    # _ArmEndHint. Detect and reject explicitly so users
-                    # get a clear error rather than silent breakage.
-                    for sub_name, _, sub_hint in arm_target._stages:
-                        if sub_hint is not None:
-                            raise NotImplementedError(
-                                f"router arm {label!r}: nested routers "
-                                f"(a Flow used as a router arm cannot "
-                                f"itself contain a router) are not yet "
-                                f"supported. Sub-stage {sub_name!r} "
-                                f"carries a topology hint."
-                            )
-                    for sub_name, sub_factory, _ in arm_target._stages:
+                    # Splice the arm Flow's stages into raw_items, re-indexing
+                    # any internal topology hints by the current offset.
+                    # Terminal stages of the inner Flow (the ones that would
+                    # produce items to consumers) become outer arm-ends.
+                    inner_offset = len(raw_items)
+                    inner_start = inner_offset
+                    inner_end = inner_offset + len(arm_target._stages) - 1
+
+                    for sub_name, sub_factory, sub_hint in arm_target._stages:
                         effective = _resolve_subflow_stage_config(
                             arm_target, sub_name
+                        )
+                        adjusted = (
+                            _reindex_topology_hint(sub_hint, inner_offset)
+                            if sub_hint is not None
+                            else None
                         )
                         raw_items.append(
                             (
                                 f"{arm_prefix}.{sub_name}",
                                 sub_factory,
-                                None,
+                                adjusted,
                                 effective or None,
                             )
                         )
+
+                    # Identify the terminal stages of the inner Flow — they
+                    # collectively become this outer arm's "ends" and feed
+                    # the outer merge. Cases:
+                    #  - Last stage hint=None: single terminal (the last).
+                    #  - Last stage is an inner-arm-end with merge=-1: that
+                    #    means the inner router was the last thing and its
+                    #    arm-ends had nowhere to go. Promote ALL such
+                    #    inner-arm-ends to outer arm-ends.
+                    #  - Inner has its own merge (e.g. flow(router(...), collect)):
+                    #    the last stage is `collect` with hint=None — single
+                    #    terminal, same as the linear case.
+                    last_idx = inner_end
+                    last_hint = raw_items[last_idx][2]
+                    inner_terminals: list[int] = []
+                    if isinstance(last_hint, _ArmEndHint) and last_hint.merge_stage_idx == -1:
+                        # Promote every inner-arm-end with merge=-1
+                        for k in range(inner_start, inner_end + 1):
+                            h = raw_items[k][2]
+                            if isinstance(h, _ArmEndHint) and h.merge_stage_idx == -1:
+                                inner_terminals.append(k)
+                    else:
+                        inner_terminals.append(last_idx)
+
+                    # Each terminal becomes an outer arm-end. Overwrite its
+                    # hint slot with a fresh _ArmEndHint (merge=-1 placeholder
+                    # resolved by the post-args pass). For terminals that
+                    # already had their own _ArmEndHint(-1), this transfers
+                    # ownership from the inner router to the outer.
+                    for term_idx in inner_terminals:
+                        bn, fac, _, eff = raw_items[term_idx]
+                        raw_items[term_idx] = (
+                            bn,
+                            fac,
+                            _ArmEndHint(merge_stage_idx=-1),
+                            eff,
+                        )
+                        arm_end_indices.append(term_idx)
+                    return inner_start
                 elif callable(arm_target):
                     arm_sig = inspect.signature(arm_target)
                     arm_param_count = len(arm_sig.parameters)
