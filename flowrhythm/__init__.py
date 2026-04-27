@@ -11,7 +11,7 @@ from ._errors import (
     SourceError,
     TransformerError,
 )
-from ._flow import Flow, Last, PushHandle, flow, stage, sync_stage
+from ._flow import Flow, Last, PushHandle, Router, flow, router, stage, sync_stage
 from ._queue import (
     AsyncQueueFactory,
     AsyncQueueInterface,
@@ -35,6 +35,7 @@ __all__ = [
     "Flow",
     "Last",
     "PushHandle",
+    "Router",
     "ScalingStrategy",
     "SourceError",
     "StageSnapshot",
@@ -44,6 +45,7 @@ __all__ = [
     "flow",
     "lifo_queue",
     "priority_queue",
+    "router",
     "stage",
     "sync_stage",
 ]

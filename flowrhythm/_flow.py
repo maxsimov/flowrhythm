@@ -138,6 +138,118 @@ def stage(target: Any, *, name: str) -> _NamedStage:
     return _NamedStage(target=target, name=name)
 
 
+class Router:
+    """A routing decision: classifier(item) → label, dispatched to arms.
+
+    Construct via the `router()` factory — never directly. See README
+    "Routing" for usage.
+    """
+
+    __slots__ = ("classifier", "arms", "default")
+
+    def __init__(
+        self,
+        classifier: TransformerFn,
+        arms: dict[str, Any],
+        default: Any | None,
+    ) -> None:
+        self.classifier = classifier
+        self.arms = arms
+        self.default = default
+
+
+def router(classifier: TransformerFn, /, **arms: Any) -> Router:
+    """Construct a router for branching by label.
+
+        router(classify, fast=quick, slow=heavy_path, default=passthrough)
+
+    `classifier` is `async def (item) -> label`. Each keyword arg is an arm
+    keyed by label; arms can be plain async functions, CM factories, or
+    `Flow` instances. The reserved keyword `default=` is a fallback arm for
+    labels that don't match any other arm. If no `default` is set and the
+    classifier returns an unknown label, the item is dropped and the error
+    handler receives a `Dropped(reason=DropReason.ROUTER_MISS)` event.
+    """
+    if not inspect.iscoroutinefunction(classifier):
+        raise TypeError(
+            "router() classifier must be an async function "
+            "(async def classify(item) -> label)"
+        )
+    sig = inspect.signature(classifier)
+    if len(sig.parameters) != 1:
+        raise TypeError(
+            "router() classifier must take exactly one argument (the item)"
+        )
+
+    default = arms.pop("default", None)
+    if not arms and default is None:
+        raise TypeError("router() requires at least one arm")
+
+    return Router(classifier=classifier, arms=arms, default=default)
+
+
+# Sentinel returned by the classifier wrapper to mean "I already routed
+# this item to an arm queue; don't put me to a single downstream."
+_DISPATCHED = object()
+
+
+@dataclass
+class _ClassifierHint:
+    """Topology hint: this stage is a router classifier. Carries the
+    user's classifier function plus the indices (in the parent's stages
+    list) of each arm's first stage. The dispatch wrapper is built at
+    `_FlowRun.__init__` time once arm-queue references exist."""
+
+    classifier_fn: TransformerFn
+    arm_first_stage_idx: dict[str, int]  # label → first-stage index
+    default_first_stage_idx: int | None
+    router_name: str  # for the Dropped event's `stage` field
+
+
+@dataclass
+class _ArmEndHint:
+    """Topology hint: this stage is the last stage of a router arm. Its
+    output goes to the merge point — the first stage right after the
+    router's expansion in the parent. Resolved at the end of `flow()`
+    once expansion is complete."""
+
+    merge_stage_idx: int  # -1 if router is last in parent (output dropped)
+
+
+def _reindex_topology_hint(hint: Any, offset: int) -> Any:
+    """Shift a topology hint's absolute stage indices by `offset`.
+
+    A `_ClassifierHint` / `_ArmEndHint` carries indices into a specific
+    `_stages` list. When a Flow containing such hints is inlined into a
+    parent (as a sub-flow), the indices need to point into the parent's
+    expanded list — `offset` is the parent's `len(raw_items)` at the
+    moment we start splicing the sub-flow in.
+    """
+    if isinstance(hint, _ClassifierHint):
+        return _ClassifierHint(
+            classifier_fn=hint.classifier_fn,
+            arm_first_stage_idx={
+                label: idx + offset
+                for label, idx in hint.arm_first_stage_idx.items()
+            },
+            default_first_stage_idx=(
+                hint.default_first_stage_idx + offset
+                if hint.default_first_stage_idx is not None
+                else None
+            ),
+            router_name=hint.router_name,
+        )
+    if isinstance(hint, _ArmEndHint):
+        return _ArmEndHint(
+            merge_stage_idx=(
+                hint.merge_stage_idx + offset
+                if hint.merge_stage_idx >= 0
+                else -1
+            )
+        )
+    return hint
+
+
 def _resolve_subflow_stage_config(
     subflow: "Flow", sub_name: str
 ) -> dict[str, Any]:
@@ -195,18 +307,37 @@ class _StageRuntime:
     # Other workers' `finally` blocks set this when alive == 1.
     last_cascade_event: asyncio.Event | None = None
 
+    # --- Topology (M8: router support) ---
+    # Index of the destination stage in `_FlowRun._stages`. None = sink (no
+    # downstream). For normal stages: i+1. For arm-end stages: the merge
+    # point (the stage right after the router's expansion). For classifier
+    # stages: None — the classifier dispatches via its wrapped user_fn.
+    downstream_stage_idx: int | None = None
+    # If set, this stage cascades to multiple downstream stages on exit
+    # (used by the classifier — its arm queues all need shutdown when the
+    # classifier finishes). Overrides downstream_stage_idx for cascade.
+    cascade_targets: list[int] | None = None
+    # Number of upstream sources still feeding this stage's input queue.
+    # Default 1 (one previous stage). Merge-point stages set N = number of
+    # contributing arm-ends; their queue is shut down only when all
+    # contributors have signaled drain.
+    pending_inputs: int = 1
+
 
 class Flow:
     """A pipeline of stages. Construct via the `flow()` factory."""
 
     def __init__(
         self,
-        stages: list[tuple[str, StageFactory]],
+        stages: list[tuple[str, StageFactory, Any | None]],
         default_scaling: ScalingStrategy | None = None,
         default_queue: AsyncQueueFactory | None = None,
         default_queue_size: int | None = None,
         on_error: ErrorHandler | None = None,
     ) -> None:
+        # Each tuple is (name, factory, topology_hint). Hint is None for
+        # plain linear stages, _ClassifierHint for router classifiers,
+        # _ArmEndHint for arm-end stages.
         self._stages = stages
         self._default_config: dict[str, Any] = {}
         if default_scaling is not None:
@@ -223,7 +354,7 @@ class Flow:
 
     @property
     def stage_names(self) -> list[str]:
-        return [name for name, _ in self._stages]
+        return [name for name, _, _ in self._stages]
 
     def configure(
         self,
@@ -427,7 +558,7 @@ class _FlowRun:
         # lives in self._stages[i] — see _StageRuntime docstring and
         # DESIGN.md "Per-stage state organization".
         self._stages: list[_StageRuntime] = []
-        for name, factory in flow._stages:
+        for name, factory, _hint in flow._stages:
             cfg = flow._resolve_config(name)
             strategy = cfg["scaling"]
             self._stages.append(
@@ -442,6 +573,50 @@ class _FlowRun:
                     # spawns the initial workers and brings alive up to target.
                 )
             )
+
+        # Wire topology (M8). For each stage:
+        #   - Default: linear chain (downstream = next stage; pending_inputs = 1)
+        #   - Classifier: replace factory with dispatch wrapper; cascade_targets
+        #     covers all arm queues; downstream_stage_idx = None.
+        #   - Arm-end: downstream_stage_idx = merge_stage_idx (or None if router
+        #     was last); contributes to merge's pending_inputs.
+        n = len(self._stages)
+        # Default linear wiring for every stage
+        for i, s in enumerate(self._stages):
+            s.downstream_stage_idx = i + 1 if i + 1 < n else None
+
+        for i, (_, _, hint) in enumerate(flow._stages):
+            if isinstance(hint, _ClassifierHint):
+                s = self._stages[i]
+                # Build dispatch wrapper that closes over arm-queue refs
+                wrapped = self._make_classifier_wrapper(hint)
+                s.factory = _wrap_plain_as_factory(wrapped)
+                s.downstream_stage_idx = None  # dispatched via wrapper
+                # Cascade: when classifier exits, shut down all arm queues
+                cascade = list(hint.arm_first_stage_idx.values())
+                if hint.default_first_stage_idx is not None:
+                    cascade.append(hint.default_first_stage_idx)
+                s.cascade_targets = cascade
+            elif isinstance(hint, _ArmEndHint):
+                s = self._stages[i]
+                merge_idx = hint.merge_stage_idx
+                s.downstream_stage_idx = merge_idx if merge_idx >= 0 else None
+                # Contribute to merge's pending_inputs counter
+                if merge_idx >= 0:
+                    self._stages[merge_idx].pending_inputs += 1
+
+        # Merge stages: subtract 1 (we initialised pending_inputs=1 default,
+        # then +1 per contributing arm-end above, so a merge with N arms
+        # ends up at 1+N. The "1" represented "previous stage in linear
+        # order" which doesn't apply to merge stages — their input comes
+        # ONLY from arms, not from a previous-in-list stage). Subtract it
+        # to leave pending_inputs = N.
+        merge_indices: set[int] = set()
+        for _, _, hint in flow._stages:
+            if isinstance(hint, _ArmEndHint) and hint.merge_stage_idx >= 0:
+                merge_indices.add(hint.merge_stage_idx)
+        for idx in merge_indices:
+            self._stages[idx].pending_inputs -= 1
 
         # Error handling — observer pattern: handler is called with typed
         # events. If the handler raises, we log and continue (handler is
@@ -530,16 +705,18 @@ class _FlowRun:
             finally:
                 s.last_cascade_event = None
 
-        # Step 4: propagate last_value as the final item entering downstream
-        if stage_idx + 1 < self._n:
-            downstream = self._stages[stage_idx + 1]
+        # Step 4: propagate last_value as the final item entering downstream.
+        # Uses topology-aware downstream (handles arm-end → merge correctly).
+        downstream_idx = s.downstream_stage_idx
+        if downstream_idx is not None:
+            downstream = self._stages[downstream_idx]
             try:
                 await downstream.queue.put(last_value)
             except asyncio.QueueShutDown:
                 return  # downstream already torn down (e.g., stop())
             self._apply_delta(
-                stage_idx + 1,
-                downstream.strategy.on_enqueue(self._make_snapshot(stage_idx + 1)),
+                downstream_idx,
+                downstream.strategy.on_enqueue(self._make_snapshot(downstream_idx)),
             )
 
     async def _push_item(self, item: Any) -> None:
@@ -633,26 +810,98 @@ class _FlowRun:
             )
 
     def _maybe_cascade(self, stage_idx: int) -> None:
-        """If stage `stage_idx` is fully drained, shut down downstream and recurse.
+        """If stage `stage_idx` is fully drained, signal its destination(s).
 
-        Called from both source_task's and worker_task's `finally`. The two
+        Called from source_task's and worker_task's `finally`. The two
         callers can fire in either order — whichever runs last (sets the
         last condition true) triggers the cascade. Recursion handles the
-        case where stages were already empty: e.g. all stage 0 workers died
-        before source ended; when source's finally sets input_drained, the
-        cascade rolls through stages 1..N here.
+        case where stages were already empty.
+
+        For routers (M8): a classifier stage cascades to ALL arm queues
+        via `cascade_targets`. An arm-end signals the merge point, which
+        only shuts down once all arm-ends have signaled.
         """
         s = self._stages[stage_idx]
         if not (s.alive == 0 and s.input_drained):
             return
-        if stage_idx + 1 >= self._n:
+
+        # Multi-target cascade (classifier → all arm queues)
+        if s.cascade_targets is not None:
+            for target_idx in s.cascade_targets:
+                self._signal_input_drain(target_idx)
             return
-        downstream = self._stages[stage_idx + 1]
-        if downstream.input_drained:
+
+        # Single-target cascade (normal stage or arm-end → merge)
+        next_idx = s.downstream_stage_idx
+        if next_idx is None:
             return
-        downstream.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
-        downstream.input_drained = True
-        self._maybe_cascade(stage_idx + 1)
+        self._signal_input_drain(next_idx)
+
+    def _signal_input_drain(self, target_idx: int) -> None:
+        """One upstream source has finished feeding `target_idx`. Decrement
+        pending_inputs; when it hits 0, shut down the queue and cascade.
+
+        For most stages pending_inputs starts at 1, so the first signal
+        immediately shuts down. Merge stages start at N (one per arm-end),
+        so they wait for all arms before draining.
+        """
+        target = self._stages[target_idx]
+        if target.input_drained:
+            return  # already shut down (idempotent)
+        target.pending_inputs -= 1
+        if target.pending_inputs > 0:
+            return  # still waiting for other contributors
+        try:
+            target.queue.shutdown(immediate=False)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        target.input_drained = True
+        self._maybe_cascade(target_idx)
+
+    def _make_classifier_wrapper(
+        self, hint: _ClassifierHint
+    ) -> "Callable[[Any], Awaitable[Any]]":
+        """Build the classifier's per-item wrapper.
+
+        Calls the user's classifier(item) → label, then dispatches `item`
+        (NOT the label) to the matching arm's input queue. Unknown labels
+        with no `default` → emit `Dropped(reason=ROUTER_MISS)`. Returns
+        the `_DISPATCHED` sentinel so the worker loop skips its normal
+        "put result downstream" step.
+        """
+        arm_first_stage_idx = hint.arm_first_stage_idx
+        default_idx = hint.default_first_stage_idx
+        classifier_fn = hint.classifier_fn
+        router_name = hint.router_name
+
+        async def dispatch(item: Any) -> Any:
+            label = await classifier_fn(item)
+            if label in arm_first_stage_idx:
+                target_idx = arm_first_stage_idx[label]
+            elif default_idx is not None:
+                target_idx = default_idx
+            else:
+                await self._handle_error(
+                    Dropped(
+                        item=item,
+                        stage=router_name,
+                        reason=DropReason.ROUTER_MISS,
+                    )
+                )
+                return _DISPATCHED
+
+            target = self._stages[target_idx]
+            try:
+                await target.queue.put(item)
+            except asyncio.QueueShutDown:
+                return _DISPATCHED  # arm torn down — silently drop
+            self._apply_delta(
+                target_idx,
+                target.strategy.on_enqueue(self._make_snapshot(target_idx)),
+            )
+            return _DISPATCHED
+
+        return dispatch
 
     def _apply_delta(self, stage_idx: int, delta: int) -> None:
         if delta == 0:
@@ -717,7 +966,13 @@ class _FlowRun:
 
     async def _worker_task(self, stage_idx: int) -> None:
         s = self._stages[stage_idx]
-        downstream = self._stages[stage_idx + 1] if stage_idx + 1 < self._n else None
+        # Topology-aware downstream: for normal stages it's the next stage
+        # in the list; for arm-end stages it's the merge point; for the
+        # classifier it's None (the dispatch wrapper handles routing).
+        downstream_idx = s.downstream_stage_idx
+        downstream = (
+            self._stages[downstream_idx] if downstream_idx is not None else None
+        )
         my_task = asyncio.current_task()
         try:
             # State 1 → 2: enter the per-worker CM. For plain transformers
@@ -764,6 +1019,12 @@ class _FlowRun:
                         )
                         continue
 
+                    if result is _DISPATCHED:
+                        # Classifier wrapper handled the routing itself
+                        # (dispatched to an arm queue or emitted Dropped).
+                        # Skip the normal "put downstream" step.
+                        continue
+
                     if isinstance(result, Last):
                         # Initiate the Last cascade: kill upstream, cancel
                         # idle siblings, wait for busy siblings, then
@@ -779,9 +1040,9 @@ class _FlowRun:
                             return
                         # Notify downstream stage that an item arrived
                         self._apply_delta(
-                            stage_idx + 1,
+                            downstream_idx,  # type: ignore[arg-type]
                             downstream.strategy.on_enqueue(
-                                self._make_snapshot(stage_idx + 1)
+                                self._make_snapshot(downstream_idx)  # type: ignore[arg-type]
                             ),
                         )
             # __aexit__ runs here on normal loop exit
@@ -850,10 +1111,17 @@ def flow(
     if not stages:
         raise TypeError("flow() requires at least one stage")
 
-    # Phase 1: walk args, expand sub-flows, collect raw items.
-    # Each entry: (base_name, factory, inlined_config_or_None).
-    raw_items: list[tuple[str, StageFactory, dict[str, Any] | None]] = []
+    # Phase 1: walk args, expand sub-flows + routers, collect raw items.
+    # Each entry: (base_name, factory, topology_hint, inlined_config_or_None).
+    raw_items: list[
+        tuple[str, StageFactory, Any | None, dict[str, Any] | None]
+    ] = []
     subflow_counter = 0
+    router_counter = 0
+    # Pending arm-end resolution: list of (router_id, arm_end_indices_list).
+    # After all args are processed, each router's _ArmEndHint stages get
+    # merge_stage_idx = (last arm-end index) + 1, or -1 if router was last.
+    pending_router_arm_ends: list[list[int]] = []
 
     for arg in stages:
         # Unwrap stage(target, name=...) wrapper
@@ -864,7 +1132,118 @@ def flow(
             explicit_name = None
             target = arg
 
-        # Sub-flow: inline its stages with prefixed names + resolved config
+        # Router expansion: classifier stage + per-arm sub-graphs
+        if isinstance(target, Router):
+            router_name = (
+                explicit_name
+                if explicit_name is not None
+                else f"_router_{router_counter}"
+            )
+            router_counter += 1
+
+            # 1. Reserve the classifier stage slot. Factory is a placeholder;
+            #    _FlowRun.__init__ replaces it with the dispatch wrapper
+            #    once arm-queue references exist.
+            classifier_hint = _ClassifierHint(
+                classifier_fn=target.classifier,
+                arm_first_stage_idx={},  # filled below
+                default_first_stage_idx=None,
+                router_name=router_name,
+            )
+            raw_items.append(
+                (router_name, _wrap_plain_as_factory(target.classifier),
+                 classifier_hint, None)
+            )
+
+            # 2. Expand each arm. Track each arm's last-stage index.
+            arm_end_indices: list[int] = []
+
+            def _expand_arm_into_raw(label: str, arm_target: Any) -> None:
+                arm_first = len(raw_items)
+                arm_prefix = f"{router_name}.{label}"
+
+                # Arm can be a Flow (sub-flow inlining) or a callable.
+                if isinstance(arm_target, Flow):
+                    # M8 limitation: nested routers (router-inside-arm-Flow)
+                    # are not yet supported because the inner router's
+                    # arm-end last stage would clash with the outer arm's
+                    # _ArmEndHint. Detect and reject explicitly so users
+                    # get a clear error rather than silent breakage.
+                    for sub_name, _, sub_hint in arm_target._stages:
+                        if sub_hint is not None:
+                            raise NotImplementedError(
+                                f"router arm {label!r}: nested routers "
+                                f"(a Flow used as a router arm cannot "
+                                f"itself contain a router) are not yet "
+                                f"supported. Sub-stage {sub_name!r} "
+                                f"carries a topology hint."
+                            )
+                    for sub_name, sub_factory, _ in arm_target._stages:
+                        effective = _resolve_subflow_stage_config(
+                            arm_target, sub_name
+                        )
+                        raw_items.append(
+                            (
+                                f"{arm_prefix}.{sub_name}",
+                                sub_factory,
+                                None,
+                                effective or None,
+                            )
+                        )
+                elif callable(arm_target):
+                    arm_sig = inspect.signature(arm_target)
+                    arm_param_count = len(arm_sig.parameters)
+                    if arm_param_count == 1:
+                        if not inspect.iscoroutinefunction(arm_target):
+                            raise TypeError(
+                                f"router arm {label!r} is sync; wrap with "
+                                f"sync_stage() or rewrite as async"
+                            )
+                        arm_factory = _wrap_plain_as_factory(arm_target)
+                    elif arm_param_count == 0:
+                        arm_factory = arm_target
+                    else:
+                        raise TypeError(
+                            f"router arm {label!r} must take 0 args (CM "
+                            f"factory) or 1 arg (transformer); got "
+                            f"{arm_param_count}"
+                        )
+                    raw_items.append((arm_prefix, arm_factory, None, None))
+                else:
+                    raise TypeError(
+                        f"router arm {label!r} must be callable or a Flow, "
+                        f"got {type(arm_target).__name__}"
+                    )
+
+                # Record this arm's last-stage index
+                arm_end = len(raw_items) - 1
+                arm_end_indices.append(arm_end)
+                return arm_first
+
+            for label, arm_target in target.arms.items():
+                first_idx = _expand_arm_into_raw(label, arm_target)
+                classifier_hint.arm_first_stage_idx[label] = first_idx
+
+            if target.default is not None:
+                first_idx = _expand_arm_into_raw("default", target.default)
+                classifier_hint.default_first_stage_idx = first_idx
+
+            # 3. Tag each arm-end with _ArmEndHint (merge_stage_idx
+            #    resolved after all args are processed).
+            for end_idx in arm_end_indices:
+                base_name, factory, _, eff = raw_items[end_idx]
+                raw_items[end_idx] = (
+                    base_name,
+                    factory,
+                    _ArmEndHint(merge_stage_idx=-1),
+                    eff,
+                )
+            pending_router_arm_ends.append(arm_end_indices)
+            continue
+
+        # Sub-flow: inline its stages with prefixed names + resolved config.
+        # If the sub-flow contains routers, re-index its hints so absolute
+        # stage indices point into THIS parent's expanded list.
         if isinstance(target, Flow):
             prefix = (
                 explicit_name
@@ -872,10 +1251,21 @@ def flow(
                 else f"_subflow_{subflow_counter}"
             )
             subflow_counter += 1
-            for sub_name, sub_factory in target._stages:
+            base_offset = len(raw_items)
+            for sub_name, sub_factory, sub_hint in target._stages:
                 effective = _resolve_subflow_stage_config(target, sub_name)
+                adjusted_hint = (
+                    _reindex_topology_hint(sub_hint, base_offset)
+                    if sub_hint is not None
+                    else None
+                )
                 raw_items.append(
-                    (f"{prefix}.{sub_name}", sub_factory, effective or None)
+                    (
+                        f"{prefix}.{sub_name}",
+                        sub_factory,
+                        adjusted_hint,
+                        effective or None,
+                    )
                 )
             continue
 
@@ -911,31 +1301,43 @@ def flow(
                 f"(transformer); got {param_count}"
             )
 
-        raw_items.append((base_name, factory, None))
+        raw_items.append((base_name, factory, None, None))
+
+    # Resolve arm-end merge points. The merge index for a router is the
+    # first stage AFTER its last arm-end; -1 if router was last in args.
+    for arm_end_indices in pending_router_arm_ends:
+        last_arm_end = max(arm_end_indices)
+        merge_idx = last_arm_end + 1 if last_arm_end + 1 < len(raw_items) else -1
+        for end_idx in arm_end_indices:
+            base_name, factory, hint, eff = raw_items[end_idx]
+            assert isinstance(hint, _ArmEndHint)
+            hint.merge_stage_idx = merge_idx
 
     # Phase 2: collision-suffix names
     counts: dict[str, int] = {}
-    final_items: list[tuple[str, StageFactory, dict[str, Any] | None]] = []
-    for base_name, factory, effective in raw_items:
+    final_items: list[
+        tuple[str, StageFactory, Any | None, dict[str, Any] | None]
+    ] = []
+    for base_name, factory, hint, effective in raw_items:
         counts[base_name] = counts.get(base_name, 0) + 1
         name = (
             base_name
             if counts[base_name] == 1
             else f"{base_name}_{counts[base_name]}"
         )
-        final_items.append((name, factory, effective))
+        final_items.append((name, factory, hint, effective))
 
     # Phase 3: construct Flow, then bake inlined sub-flow configs into the
     # parent's per-stage config map. Parent's later configure() calls
     # overwrite per key (most-specific wins, per key — not per stage).
     flow_obj = Flow(
-        stages=[(n, f) for n, f, _ in final_items],
+        stages=[(n, f, h) for n, f, h, _ in final_items],
         default_scaling=default_scaling,
         default_queue=default_queue,
         default_queue_size=default_queue_size,
         on_error=on_error,
     )
-    for name, _, effective in final_items:
+    for name, _, _, effective in final_items:
         if effective:
             flow_obj._stage_config[name] = dict(effective)
 
