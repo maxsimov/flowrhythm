@@ -211,13 +211,22 @@ Coverage: 95% overall (94% on `_flow.py`). 118 tests pass in 0.09s. `make lint` 
 
 Goal: `router(classifier, **arms, default=None)` works as a graph-fragment stage.
 
-- [ ] `Router` class with `classifier`, `arms`, `default` attributes
-- [ ] `router(classifier, **arms, default=None)` factory function
-- [ ] Arm expansion: each arm becomes a sub-graph in the parent (treated like sub-flow if arm is a `Flow`, or as a single stage if it's a callable)
-- [ ] Classifier runs as a single stage that dispatches items to arm input queues
-- [ ] All arm outputs feed the same downstream queue
-- [ ] If classifier returns unknown label and no `default`: emit `Dropped(..., ROUTER_MISS)` event; item discarded
-- [ ] Tests: arm dispatch by label; `default` arm fallback; ROUTER_MISS reported as `Dropped`
+- [x] `Router` class with `classifier`, `arms`, `default` attributes — `__slots__`-based, constructed only via the `router()` factory
+- [x] `router(classifier, **arms, default=None)` factory — validates classifier (must be 1-arg async); rejects no-arms; pops `default` keyword
+- [x] Arm expansion in `flow()` — three-phase walk now handles `Router` args: classifier slot + each arm inlined under `<router>.<label>` prefix (callable → single stage; Flow → sub-flow inlining). Nested routers (router-in-arm-Flow) raise `NotImplementedError` for M8.
+- [x] Classifier dispatch: runtime wrapper built at `_FlowRun.__init__` once arm-queue refs exist; calls user's classifier(item) → label, puts the original item into the matching arm's queue, fires the strategy's `on_enqueue`. Returns `_DISPATCHED` sentinel so the worker loop skips its normal "put downstream" step.
+- [x] Topology fields on `_StageRuntime`: `downstream_stage_idx` (per-stage destination index, replaces hardcoded `i+1`), `cascade_targets` (multi-target shutdown for classifier → all arm queues), `pending_inputs` (merge stages set N = number of arm-ends, drain only when all signal).
+- [x] New `_signal_input_drain()` mechanism in `_FlowRun` — backs invariant I13. The first signal usually shuts a queue down; merge queues wait for N signals.
+- [x] `_handle_last` and `_maybe_cascade` updated to use `s.downstream_stage_idx` instead of hardcoded `i+1` (so arm-end Last/cascade routes to merge correctly).
+- [x] Re-indexer (`_reindex_topology_hint`) shifts indices when a Flow containing a router is inlined as a sub-flow — preserves correctness across base-offset changes.
+- [x] ROUTER_MISS → `Dropped(item, stage=router_name, reason=DropReason.ROUTER_MISS)` via the existing observer-only handler.
+- [x] Tests (`tests/test_flow_router.py` — 14 tests): basic dispatch by label; outputs flow to next stage; default arm catches unknown labels; ROUTER_MISS event emitted; Flow as arm (sub-flow inlining inside arm); explicit + fallback naming; two unwrapped routers get distinct indices; per-arm config; classifier validation (no arms, sync); sub-flow with router used as sub-flow (re-indexer); nested router in arm raises; `Router`/`router` exported.
+
+Coverage: 95% overall (93% on `_flow.py`). 133 tests pass in 0.10s. `make lint` clean.
+
+Deferred to a later milestone:
+- Nested routers in arm Flows (currently raises `NotImplementedError` with a clear hint)
+- Last(value) inside a router arm — works for the linear cascade but the upstream-kill semantics across multiple arms is untested; document as gray area
 
 ### M9 — `dump(mode="structure")`
 

@@ -49,9 +49,12 @@ No special timing logic, no rate config. Users who want different behavior have 
 - **Rate-limited emission** — add `await asyncio.sleep(...)` inside the user's first transformer (the fetcher)
 
 ### Routing
-- `router(classifier, **arms, default=...)` — branching as a regular transformer
-- If classifier returns unknown label and no `default`, raises `ValueError`
-- Arms can be any Transformer (callable, chain, Flow)
+- `router(classifier, **arms, default=...)` — branching expanded as a sub-graph at construction (NOT a per-item function call)
+- The classifier runs as a single stage that dispatches each item to one arm's input queue
+- Arms can be plain async functions, CM factories, or `Flow` sub-pipelines — each gets its own input queue and worker pool
+- All arm outputs converge into the same merge queue (the stage right after the router in the parent)
+- If the classifier returns a label with no matching arm and no `default`, the item is dropped and the error handler receives a `Dropped(reason=DropReason.ROUTER_MISS)` event (observer-only — pipeline continues)
+- Nested routers inside a router arm are not yet supported (M8 limitation; raises `NotImplementedError` at construction)
 
 ### Composability
 - A `Flow` plugs into another `flow()` as a stage
@@ -650,6 +653,14 @@ Implications:
 - Parent's `on_error` always wins for events from sub-stages — backs the "Sub-flow autonomy" carve-out.
 - Activating an embedded sub-flow directly (`inner.run(...)` after `outer = flow(inner, ...)`) would create a separate `_FlowRun` on `inner`, parallel to and disconnected from `outer` — currently not enforced as an error, but never useful.
 - Modifying `inner.configure(...)` after composition has no effect — the inlined config was baked at construction time.
+
+### I13 — Merge queue drains only after all contributing arm-ends signal
+
+A router's classifier dispatches items into N arm queues; the arms' last stages all feed a single **merge queue** (the stage right after the router in the parent). Each arm-end stage holds a "drain signal" for the merge: the merge queue's `pending_inputs` counter starts at N (one per arm-end) and is decremented by `_signal_input_drain()` whenever an arm-end fully drains (`alive == 0 AND input_drained`). The merge queue is shut down only when `pending_inputs` reaches 0.
+
+For non-merge stages, `pending_inputs == 1` (one upstream source — the previous stage in linear order, or the source task for stage 0). The first signal shuts the queue down immediately.
+
+Without this invariant, the first arm-end to finish would shut down the merge queue, killing items still in flight from slower arms.
 
 ---
 
