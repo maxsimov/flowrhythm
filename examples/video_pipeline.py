@@ -5,22 +5,17 @@ fetch metadata for each URL, conditionally transcode with ffmpeg,
 upload to object storage, then record to a database.
 
 All external calls (HTTP, ffmpeg, S3, DB) are mocked with `asyncio.sleep`
-so this runs without yt-dlp / ffmpeg / boto3 / a database. The pipeline
-shape, scaling configuration, and resource handling match what you'd
-actually ship.
+so this runs without yt-dlp / ffmpeg / boto3 / a database.
 
     Topology:
 
         URLs → fetch_metadata → router(needs_conversion?) ─┬─ download → transcode ─┐
                                                            └─ download ──────────────┴─► upload → record_db
 
-    Per-stage characteristics drive scaling:
-
-      fetch_metadata   I/O bound (HTTP)         scale wide      (2..8)
-      download         I/O bound (network)      scale wider     (4..12)
-      transcode        CPU bound (ffmpeg)       cap narrow      (workers=2)
-      upload           I/O bound (S3)           scale wide      (2..8)
-      record_db        light, ordering matters  single worker
+The example uses defaults everywhere (single worker per stage, fifo
+queue, default error handling) — minimal ceremony. For production
+you'd tune scaling per stage with `chain.configure(...)`; see the
+"Configuring a flow" and "Scaling Strategies" sections in README.md.
 
 Run:    python examples/video_pipeline.py
 """
@@ -32,10 +27,8 @@ from dataclasses import dataclass
 
 from flowrhythm import (
     Dropped,
-    FixedScaling,
     SourceError,
     TransformerError,
-    UtilizationScaling,
     flow,
     router,
 )
@@ -211,30 +204,6 @@ async def main():
         record_db,
         on_error=on_error,
     )
-
-    # Per-stage tuning — each strategy matched to the stage's nature.
-    # Stage names auto-derived from function names; the router with no
-    # explicit name gets `_router_0` (and dotted sub-stage names below it).
-    chain.configure(
-        "fetch_metadata",
-        scaling=UtilizationScaling(min_workers=2, max_workers=8),
-    )
-    chain.configure(
-        "_router_0.convert.download",
-        scaling=UtilizationScaling(min_workers=4, max_workers=12),
-    )
-    chain.configure(
-        "_router_0.convert.transcode",
-        scaling=FixedScaling(workers=2),
-    )
-    chain.configure(
-        "_router_0.passthrough",
-        scaling=UtilizationScaling(min_workers=4, max_workers=12),
-    )
-    chain.configure(
-        "upload", scaling=UtilizationScaling(min_workers=2, max_workers=8)
-    )
-    chain.configure("record_db", scaling=FixedScaling(workers=1))
 
     # 1. Show the topology before running — useful as a sanity check
     print("=== TOPOLOGY ===")
