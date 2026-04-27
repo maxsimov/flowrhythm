@@ -507,6 +507,302 @@ async def test_router_path_tracing_through_nested_topology():
 
 
 # ---------------------------------------------------------------------------
+# Topology completeness
+# ---------------------------------------------------------------------------
+
+
+async def test_router_as_last_stage_arm_outputs_drop_silently():
+    """When the router is the last thing in the parent flow, arm outputs
+    have nowhere to go (merge_stage_idx = -1 → downstream = None). The
+    pipeline must still drain cleanly."""
+    received = []
+
+    async def classify(x):
+        return "a" if x % 2 == 0 else "b"
+
+    async def fn_a(x):
+        received.append(("a", x))
+        return x  # return value is dropped (no downstream)
+
+    async def fn_b(x):
+        received.append(("b", x))
+        return x
+
+    chain = flow(router(classify, a=fn_a, b=fn_b))
+
+    async def items():
+        for i in range(6):
+            yield i
+
+    import asyncio
+    async with asyncio.timeout(2):
+        await chain.run(items)
+
+    # Arm side-effects fired for every item; outputs were silently dropped
+    assert sorted(received) == [
+        ("a", 0), ("a", 2), ("a", 4),
+        ("b", 1), ("b", 3), ("b", 5),
+    ]
+
+
+async def test_sequential_routers_chain_correctly():
+    """Two routers in series: r1's merge IS r2's classifier input.
+    Verifies arm-end → next-router-classifier wiring."""
+    received: list[dict] = []
+
+    async def items():
+        for v in range(4):
+            yield {"value": v, "trail": []}
+
+    async def cls1(item):
+        item["trail"].append("cls1")
+        return "even" if item["value"] % 2 == 0 else "odd"
+
+    async def even_arm(item):
+        item["trail"].append("even_arm")
+        return item
+
+    async def odd_arm(item):
+        item["trail"].append("odd_arm")
+        return item
+
+    async def cls2(item):
+        item["trail"].append("cls2")
+        return "small" if item["value"] < 2 else "big"
+
+    async def small(item):
+        item["trail"].append("small")
+        return item
+
+    async def big(item):
+        item["trail"].append("big")
+        return item
+
+    async def collect(item):
+        received.append(item)
+
+    chain = flow(
+        stage(router(cls1, even=even_arm, odd=odd_arm), name="r1"),
+        stage(router(cls2, small=small, big=big), name="r2"),
+        collect,
+    )
+    await chain.run(items)
+
+    assert len(received) == 4
+    by_value = {item["value"]: item for item in received}
+    assert by_value[0]["trail"] == ["cls1", "even_arm", "cls2", "small"]
+    assert by_value[1]["trail"] == ["cls1", "odd_arm", "cls2", "small"]
+    assert by_value[2]["trail"] == ["cls1", "even_arm", "cls2", "big"]
+    assert by_value[3]["trail"] == ["cls1", "odd_arm", "cls2", "big"]
+
+
+async def test_router_arm_can_be_cm_factory():
+    """A 0-arg callable returning AsyncContextManager works as an arm."""
+    from contextlib import asynccontextmanager
+
+    received = []
+    aenter_count = 0
+    aexit_count = 0
+
+    @asynccontextmanager
+    async def with_resource():
+        nonlocal aenter_count, aexit_count
+        aenter_count += 1
+        try:
+            async def fn(x):
+                received.append(x)
+                return x
+
+            yield fn
+        finally:
+            aexit_count += 1
+
+    async def classify(x):
+        return "go"
+
+    chain = flow(router(classify, go=with_resource))
+
+    async def items():
+        for i in range(3):
+            yield i
+
+    await chain.run(items)
+    assert sorted(received) == [0, 1, 2]
+    # CM factory was entered (at least once — exact count depends on workers)
+    assert aenter_count >= 1
+    assert aexit_count == aenter_count
+
+
+# ---------------------------------------------------------------------------
+# Error handling under router
+# ---------------------------------------------------------------------------
+
+
+async def test_classifier_raise_routes_through_handler_with_router_name():
+    """Classifier exception → TransformerError with stage = router's name."""
+    from flowrhythm import TransformerError
+
+    events = []
+
+    async def on_error(event):
+        events.append(event)
+
+    async def boom_classify(x):
+        raise RuntimeError(f"classifier failed on {x}")
+
+    async def fn_a(x):
+        pass
+
+    chain = flow(
+        stage(router(boom_classify, a=fn_a), name="my_router"),
+        on_error=on_error,
+    )
+
+    async def items():
+        for i in range(3):
+            yield i
+
+    await chain.run(items)
+    assert len(events) == 3
+    for e in events:
+        assert isinstance(e, TransformerError)
+        assert e.stage == "my_router"
+        assert isinstance(e.exception, RuntimeError)
+
+
+async def test_arm_raise_routes_through_handler_with_arm_name():
+    """Arm exception → TransformerError with stage = '<router>.<arm_label>'."""
+    from flowrhythm import TransformerError
+
+    events = []
+    handled_by_ok = []
+
+    async def on_error(event):
+        events.append(event)
+
+    async def classify(x):
+        return "fail" if x % 2 == 0 else "ok"
+
+    async def fail_arm(x):
+        raise RuntimeError(f"arm boom: {x}")
+
+    async def ok_arm(x):
+        handled_by_ok.append(x)
+
+    chain = flow(
+        stage(router(classify, fail=fail_arm, ok=ok_arm), name="r"),
+        on_error=on_error,
+    )
+
+    async def items():
+        for i in range(4):
+            yield i
+
+    await chain.run(items)
+
+    # Items 0, 2 went to fail (raised); items 1, 3 went to ok (succeeded)
+    assert sorted(handled_by_ok) == [1, 3]
+    assert len(events) == 2
+    for e in events:
+        assert isinstance(e, TransformerError)
+        assert e.stage == "r.fail"
+        assert isinstance(e.exception, RuntimeError)
+    assert sorted(e.item for e in events) == [0, 2]
+
+
+# ---------------------------------------------------------------------------
+# Termination through router topology
+# ---------------------------------------------------------------------------
+
+
+async def test_drain_while_items_in_arms_completes_cleanly():
+    """drain() shuts down classifier's queue; cascade flows through all arm
+    queues; merge counts down as each arm finishes; pipeline drains.
+    Exercises the multi-stage cascade through a router."""
+    import asyncio
+
+    received = []
+    started = asyncio.Event()
+    received_lock = asyncio.Lock()
+
+    async def classify(x):
+        return "a" if x % 2 == 0 else "b"
+
+    async def slow_arm(x):
+        async with received_lock:
+            received.append(x)
+            if len(received) >= 3:
+                started.set()
+        return x
+
+    async def collect(x):
+        pass
+
+    chain = flow(router(classify, a=slow_arm, b=slow_arm), collect)
+
+    async def items():
+        for i in range(1_000_000):
+            yield i
+
+    run_task = asyncio.create_task(chain.run(items))
+
+    async with asyncio.timeout(2):
+        await started.wait()
+        await chain.drain()
+        await run_task
+
+    # Drain stopped the source; some items processed but far from 1M
+    assert len(received) >= 3
+    assert len(received) < 1000
+
+
+async def test_stop_runs_arm_worker_cleanup():
+    """stop() cancels every arm worker; their CM __aexit__ must still run.
+    Verifies M5's resource-safety guarantee survives router topology."""
+    from contextlib import asynccontextmanager
+    import asyncio
+
+    aenter_count = 0
+    aexit_count = 0
+    started = asyncio.Event()
+    counts_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def factory():
+        nonlocal aenter_count, aexit_count
+        async with counts_lock:
+            aenter_count += 1
+        started.set()
+        try:
+            async def fn(x):
+                await asyncio.sleep(60)  # never finishes; stop cancels
+
+            yield fn
+        finally:
+            async with counts_lock:
+                aexit_count += 1
+
+    async def classify(x):
+        return "go"
+
+    chain = flow(router(classify, go=factory))
+
+    async def items():
+        for i in range(1_000_000):
+            yield i
+
+    run_task = asyncio.create_task(chain.run(items))
+
+    async with asyncio.timeout(2):
+        await started.wait()
+        await chain.stop()
+        await run_task
+
+    assert aenter_count >= 1
+    assert aexit_count == aenter_count
+
+
+# ---------------------------------------------------------------------------
 # Public API exports
 # ---------------------------------------------------------------------------
 
