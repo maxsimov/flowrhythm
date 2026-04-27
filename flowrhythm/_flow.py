@@ -809,6 +809,16 @@ class _FlowRun:
         In push mode there's no source_task whose `finally` flips
         `_source_finished`; we set it here. Idempotent if the queue is
         already shut down.
+
+        Note: we deliberately do NOT call `_maybe_cascade(0)` here. In
+        push mode `_mark_complete` may run BEFORE `execute()` spawns
+        workers (because `__aexit__` calls complete then awaits the
+        exec task). At that point `alive == 0` for every stage, and a
+        cascade would shut down all downstream queues prematurely —
+        the classifier worker, when it eventually runs, would dispatch
+        items into closed arm queues and silently drop them. Letting
+        the classifier worker's own `finally` trigger the cascade
+        avoids this race.
         """
         try:
             self._stages[0].queue.shutdown(immediate=False)  # type: ignore[attr-defined]
@@ -816,7 +826,6 @@ class _FlowRun:
             pass
         self._stages[0].input_drained = True
         self._source_finished = True
-        self._maybe_cascade(0)
         self._check_done()
 
     async def drain(self) -> None:

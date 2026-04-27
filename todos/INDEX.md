@@ -7,7 +7,7 @@ Index of TODO plans. Each plan is a markdown file with a status header and a che
 | Plan | Status | Updated |
 |---|---|---|
 | [implement-runtime](implement-runtime.md) | in-progress | 2026-04-26 |
-| [router-test-rigor](router-test-rigor.md) | planned | 2026-04-27 |
+| [router-test-rigor](router-test-rigor.md) | implemented | 2026-04-27 |
 | [dump-implementation](dump-implementation.md) | planned | 2026-04-26 |
 | [readme-rewrite](readme-rewrite.md) | implemented | 2026-04-26 |
 

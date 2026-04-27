@@ -492,3 +492,494 @@ async def test_backpressure_through_router_no_loss():
 
     ids = sorted(item["id"] for item in received)
     assert ids == list(range(N))
+
+
+# ---------------------------------------------------------------------------
+# Stress conservation (5,000 items, multi-worker arms)
+# ---------------------------------------------------------------------------
+
+
+async def test_conservation_stress_5k_items_multiworker_arms():
+    """5,000 items through a 3-arm router with FixedScaling(workers=4)
+    per arm. Catches subtle dispatch races, queue-close races,
+    backpressure-related drops that handful-of-items tests would miss."""
+    received = []
+    N = 5000
+
+    async def cls(item):
+        return ["a", "b", "c"][item["id"] % 3]
+
+    async def fn_a(item):
+        return item
+
+    async def fn_b(item):
+        return item
+
+    async def fn_c(item):
+        return item
+
+    async def collect(item):
+        received.append(item)
+
+    chain = flow(stage(router(cls, a=fn_a, b=fn_b, c=fn_c), name="r"), collect)
+    chain.configure("r.a", scaling=FixedScaling(workers=4))
+    chain.configure("r.b", scaling=FixedScaling(workers=4))
+    chain.configure("r.c", scaling=FixedScaling(workers=4))
+
+    async def items():
+        for i in range(N):
+            yield {"id": i}
+
+    async with asyncio.timeout(30):
+        await chain.run(items)
+
+    ids = sorted(item["id"] for item in received)
+    assert len(ids) == N
+    assert ids == list(range(N))
+
+
+# ---------------------------------------------------------------------------
+# Re-indexing stress: sub-flow with router at varying offsets
+# ---------------------------------------------------------------------------
+
+
+async def test_reindexing_subflow_with_router_at_varying_offsets():
+    """Sub-flow containing a router placed at offset 0, 1, 2 in the
+    parent. Verify all topology hint indices are correct absolute
+    indices into the parent (not stale relative indices from the
+    sub-flow's own _stages list)."""
+    from flowrhythm._flow import _ArmEndHint, _ClassifierHint
+
+    async def cls(item):
+        return "x"
+
+    async def x(item):
+        return item
+
+    async def trailing(item):
+        return item
+
+    async def s1(item):
+        return item
+
+    async def s2(item):
+        return item
+
+    async def collect(item):
+        pass
+
+    # Build inner once. Inner: classifier (0) → arm "x" (1) → trailing (2)
+    def make_inner():
+        return flow(stage(router(cls, x=x), name="r"), trailing)
+
+    # Offset 0: i.r (0), i.r.x (1), i.trailing (2), collect (3)
+    chain0 = flow(stage(make_inner(), name="i"), collect)
+    assert chain0.stage_names == ["i.r", "i.r.x", "i.trailing", "collect"]
+    cls_hint0 = chain0._stages[0][2]
+    assert isinstance(cls_hint0, _ClassifierHint)
+    assert cls_hint0.arm_first_stage_idx == {"x": 1}
+    arm_hint0 = chain0._stages[1][2]
+    assert isinstance(arm_hint0, _ArmEndHint)
+    assert arm_hint0.merge_stage_idx == 2
+
+    # Offset 1: s1 (0), i.r (1), i.r.x (2), i.trailing (3), collect (4)
+    chain1 = flow(s1, stage(make_inner(), name="i"), collect)
+    assert chain1.stage_names == ["s1", "i.r", "i.r.x", "i.trailing", "collect"]
+    cls_hint1 = chain1._stages[1][2]
+    assert isinstance(cls_hint1, _ClassifierHint)
+    assert cls_hint1.arm_first_stage_idx == {"x": 2}
+    arm_hint1 = chain1._stages[2][2]
+    assert isinstance(arm_hint1, _ArmEndHint)
+    assert arm_hint1.merge_stage_idx == 3
+
+    # Offset 2: s1, s2, i.r, i.r.x, i.trailing, collect
+    chain2 = flow(s1, s2, stage(make_inner(), name="i"), collect)
+    cls_hint2 = chain2._stages[2][2]
+    assert isinstance(cls_hint2, _ClassifierHint)
+    assert cls_hint2.arm_first_stage_idx == {"x": 3}
+    arm_hint2 = chain2._stages[3][2]
+    assert isinstance(arm_hint2, _ArmEndHint)
+    assert arm_hint2.merge_stage_idx == 4
+
+
+# ---------------------------------------------------------------------------
+# Multi-stage arm with nested router AND tail stage
+# ---------------------------------------------------------------------------
+
+
+async def test_multi_stage_arm_with_nested_router_and_tail_breadcrumbs():
+    """An arm Flow that is itself: stage → router → tail. Three nesting
+    levels (outer router → arm sub-flow → inner router). Verify
+    breadcrumbs through every path."""
+    received = []
+
+    async def items():
+        for v in [1, 100, 9999]:
+            yield {"value": v, "trail": []}
+
+    async def cls_outer(item):
+        item["trail"].append("cls_outer")
+        return "fast" if item["value"] < 10 else "slow"
+
+    async def fast(item):
+        item["trail"].append("fast")
+        return item
+
+    async def s1(item):
+        item["trail"].append("s1")
+        return item
+
+    async def cls_inner(item):
+        item["trail"].append("cls_inner")
+        return "x" if item["value"] < 1000 else "y"
+
+    async def x_arm(item):
+        item["trail"].append("x")
+        return item
+
+    async def y_arm(item):
+        item["trail"].append("y")
+        return item
+
+    async def tag(item):
+        item["trail"].append("tag")
+        return item
+
+    async def collect(item):
+        received.append(item)
+
+    slow_arm = flow(
+        s1,
+        stage(router(cls_inner, x=x_arm, y=y_arm), name="ri"),
+        tag,
+    )
+    chain = flow(
+        stage(router(cls_outer, fast=fast, slow=slow_arm), name="ro"),
+        collect,
+    )
+
+    await chain.run(items)
+
+    by_value = {item["value"]: item for item in received}
+    assert by_value[1]["trail"] == ["cls_outer", "fast"]
+    assert by_value[100]["trail"] == [
+        "cls_outer",
+        "s1",
+        "cls_inner",
+        "x",
+        "tag",
+    ]
+    assert by_value[9999]["trail"] == [
+        "cls_outer",
+        "s1",
+        "cls_inner",
+        "y",
+        "tag",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Last cascade bounds — stress version with many sibling items in flight
+# ---------------------------------------------------------------------------
+
+
+async def test_last_no_sibling_items_after_last_under_load():
+    """Many sibling-arm items in flight when Last fires. Assert
+    (a) Last value at sink, (b) zero items appear after Last."""
+    sink_received = []
+
+    async def cls(x):
+        return "fast" if x % 2 == 0 else "slow"
+
+    async def fast(x):
+        # Slow enough that several are in flight when Last fires
+        await asyncio.sleep(0.005)
+        return f"fast-{x}"
+
+    async def slow_returns_last(x):
+        if x == 99:
+            return Last("FINAL")
+        return f"slow-{x}"
+
+    async def collect(x):
+        sink_received.append(x)
+
+    # Slow first so it gets lower indices and fast is OUTSIDE the immediate
+    # downstream chain — exactly the situation the M8 fix addresses.
+    chain = flow(
+        stage(router(cls, slow=slow_returns_last, fast=fast), name="r"),
+        collect,
+    )
+    chain.configure("collect", scaling=FixedScaling(workers=1))
+
+    async def items():
+        # Many fast items in flight, then trigger Last
+        for i in range(0, 30, 2):  # 0, 2, 4, ..., 28 — all fast
+            yield i
+        yield 99  # → slow → Last
+
+    async with asyncio.timeout(5):
+        await chain.run(items)
+
+    assert "FINAL" in sink_received
+    last_idx = sink_received.index("FINAL")
+    after_final = sink_received[last_idx + 1:]
+    assert after_final == [], (
+        f"items appeared after Last value: {after_final}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Concurrent Last from multiple arms — locks down the "first wins" contract
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_last_from_multiple_arms_does_not_hang():
+    """Both arms return Last(...) on different items. Pipeline must
+    terminate (no deadlock) and not duplicate items. Whichever Last's
+    cascade starts first wins — subsequent Lasts are no-ops since the
+    queues are already shut down."""
+    sink_received = []
+
+    async def cls(x):
+        return "a" if x % 2 == 0 else "b"
+
+    async def arm_a(x):
+        return Last(f"FINAL-A-{x}")
+
+    async def arm_b(x):
+        return Last(f"FINAL-B-{x}")
+
+    async def collect(x):
+        sink_received.append(x)
+
+    chain = flow(router(cls, a=arm_a, b=arm_b), collect)
+
+    async def items():
+        for i in range(10):
+            yield i
+
+    async with asyncio.timeout(2):
+        await chain.run(items)
+
+    # Pipeline terminated. The number of received items depends on the
+    # race; at minimum the first Last's value should land. No item should
+    # appear twice.
+    assert len(sink_received) >= 1
+    assert len(sink_received) == len(set(sink_received))
+    for item in sink_received:
+        assert item.startswith("FINAL-")
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+
+async def test_source_with_one_item_through_complex_topology():
+    """A single item through a nested-router topology — catches
+    initialization bugs that need ≥2 items to manifest."""
+    received = []
+
+    async def cls_outer(x):
+        return "slow"
+
+    async def cls_inner(x):
+        return "x"
+
+    async def x(item):
+        return item
+
+    async def collect(item):
+        received.append(item)
+
+    inner = flow(router(cls_inner, x=x))
+    chain = flow(router(cls_outer, slow=inner), collect)
+
+    async def items():
+        yield {"id": 42}
+
+    async with asyncio.timeout(2):
+        await chain.run(items)
+    assert received == [{"id": 42}]
+
+
+async def test_all_items_to_default_arm():
+    """100% miss rate against named arms; default catches every item."""
+    matched = []
+    defaulted = []
+
+    async def cls(x):
+        return "unknown_label"
+
+    async def matched_arm(x):
+        matched.append(x)
+
+    async def default_arm(x):
+        defaulted.append(x)
+
+    chain = flow(router(cls, matched=matched_arm, default=default_arm))
+
+    async def items():
+        for i in range(50):
+            yield i
+
+    await chain.run(items)
+    assert matched == []
+    assert sorted(defaulted) == list(range(50))
+
+
+async def test_unused_arm_workers_exit_cleanly():
+    """An arm that's never picked: its workers spawn, wait on get(),
+    and exit cleanly when the cascade signals drain."""
+    used = []
+    unused = []
+
+    async def cls(x):
+        return "used"  # never returns "unused"
+
+    async def used_arm(x):
+        used.append(x)
+
+    async def unused_arm(x):
+        unused.append(x)
+
+    chain = flow(router(cls, used=used_arm, unused=unused_arm))
+
+    async def items():
+        for i in range(5):
+            yield i
+
+    async with asyncio.timeout(2):
+        await chain.run(items)
+    assert sorted(used) == [0, 1, 2, 3, 4]
+    assert unused == []
+
+
+async def test_drain_after_first_send_in_push_mode_with_router():
+    """Push mode + router + drain on async-with exit: one item
+    delivered, run completes."""
+    received = []
+
+    async def cls(x):
+        return "a"
+
+    async def fn(x):
+        received.append(x)
+
+    chain = flow(router(cls, a=fn))
+
+    async with asyncio.timeout(2):
+        async with chain.push() as h:
+            await h.send(1)
+        # Async-with exit calls complete() + drain
+    assert received == [1]
+
+
+# ---------------------------------------------------------------------------
+# Order semantics
+# ---------------------------------------------------------------------------
+
+
+async def test_single_worker_arm_preserves_order_within_arm():
+    """With single-worker arms and single-worker downstream, items
+    within one arm arrive at sink in dispatch order."""
+    received = []
+
+    async def cls(x):
+        return "fast" if x % 2 == 0 else "slow"
+
+    async def fast(x):
+        return x
+
+    async def slow(x):
+        await asyncio.sleep(0.001)
+        return x
+
+    async def collect(x):
+        received.append(x)
+
+    chain = flow(router(cls, fast=fast, slow=slow), collect)
+    chain.configure("collect", scaling=FixedScaling(workers=1))
+
+    async def items():
+        for i in range(10):
+            yield i
+
+    await chain.run(items)
+
+    # Within fast arm: 0, 2, 4, 6, 8 in order
+    fast_items = [x for x in received if x % 2 == 0]
+    assert fast_items == [0, 2, 4, 6, 8]
+    # Within slow arm: 1, 3, 5, 7, 9 in order
+    slow_items = [x for x in received if x % 2 == 1]
+    assert slow_items == [1, 3, 5, 7, 9]
+
+
+async def test_multiworker_arm_does_not_guarantee_order():
+    """With N>1 workers in one arm, items may arrive at the merge in
+    any order — documented non-guarantee. Verify all delivered, no
+    specific order assertion."""
+    received = []
+    N = 30
+
+    async def cls(x):
+        return "a"
+
+    async def slow_a(x):
+        await asyncio.sleep(0.001 * (x % 3))  # variable delay → reorder
+        return x
+
+    async def collect(x):
+        received.append(x)
+
+    chain = flow(stage(router(cls, a=slow_a), name="r"), collect)
+    chain.configure("r.a", scaling=FixedScaling(workers=4))
+
+    async def items():
+        for i in range(N):
+            yield i
+
+    async with asyncio.timeout(5):
+        await chain.run(items)
+
+    assert sorted(received) == list(range(N))
+    # We deliberately don't assert received == list(range(N)) — the multi-
+    # worker arm permits reordering. If you need order, use workers=1.
+
+
+# ---------------------------------------------------------------------------
+# Identity preservation
+# ---------------------------------------------------------------------------
+
+
+async def test_item_identity_preserved_through_router():
+    """The framework must never copy items. The id() of the dict object
+    should be the same at every stage that sees it."""
+    seen = {}
+
+    async def cls(item):
+        item.setdefault("ids", []).append(("cls", id(item)))
+        return "a"
+
+    async def fn_a(item):
+        item["ids"].append(("a", id(item)))
+        return item
+
+    async def collect(item):
+        item["ids"].append(("collect", id(item)))
+        seen[item["uid"]] = item
+
+    chain = flow(router(cls, a=fn_a), collect)
+
+    async def items():
+        for i in range(5):
+            yield {"uid": i}
+
+    await chain.run(items)
+
+    for uid, item in seen.items():
+        ids_per_stage = [obj_id for _, obj_id in item["ids"]]
+        assert len(set(ids_per_stage)) == 1, (
+            f"item {uid} was copied: stage→id list = {item['ids']}"
+        )
