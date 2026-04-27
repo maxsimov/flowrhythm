@@ -188,11 +188,6 @@ def router(classifier: TransformerFn, /, **arms: Any) -> Router:
     return Router(classifier=classifier, arms=arms, default=default)
 
 
-# Sentinel returned by the classifier wrapper to mean "I already routed
-# this item to an arm queue; don't put me to a single downstream."
-_DISPATCHED = object()
-
-
 @dataclass
 class _ClassifierHint:
     """Topology hint: this stage is a router classifier. Carries the
@@ -866,15 +861,15 @@ class _FlowRun:
         Calls the user's classifier(item) → label, then dispatches `item`
         (NOT the label) to the matching arm's input queue. Unknown labels
         with no `default` → emit `Dropped(reason=ROUTER_MISS)`. Returns
-        the `_DISPATCHED` sentinel so the worker loop skips its normal
-        "put result downstream" step.
+        None — the worker loop skips its "put downstream" step because the
+        classifier's `downstream_stage_idx` is None.
         """
         arm_first_stage_idx = hint.arm_first_stage_idx
         default_idx = hint.default_first_stage_idx
         classifier_fn = hint.classifier_fn
         router_name = hint.router_name
 
-        async def dispatch(item: Any) -> Any:
+        async def dispatch(item: Any) -> None:
             label = await classifier_fn(item)
             if label in arm_first_stage_idx:
                 target_idx = arm_first_stage_idx[label]
@@ -888,18 +883,17 @@ class _FlowRun:
                         reason=DropReason.ROUTER_MISS,
                     )
                 )
-                return _DISPATCHED
+                return
 
             target = self._stages[target_idx]
             try:
                 await target.queue.put(item)
             except asyncio.QueueShutDown:
-                return _DISPATCHED  # arm torn down — silently drop
+                return  # arm torn down — silently drop
             self._apply_delta(
                 target_idx,
                 target.strategy.on_enqueue(self._make_snapshot(target_idx)),
             )
-            return _DISPATCHED
 
         return dispatch
 
@@ -1017,12 +1011,6 @@ class _FlowRun:
                                 item=item, exception=exc, stage=s.name
                             )
                         )
-                        continue
-
-                    if result is _DISPATCHED:
-                        # Classifier wrapper handled the routing itself
-                        # (dispatched to an arm queue or emitted Dropped).
-                        # Skip the normal "put downstream" step.
                         continue
 
                     if isinstance(result, Last):
