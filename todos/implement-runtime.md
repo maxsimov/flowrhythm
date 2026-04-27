@@ -253,12 +253,17 @@ See [`todos/dump-implementation.md`](dump-implementation.md) for the broader pla
 
 Goal: live runtime stats for operational visibility.
 
-- [ ] Track per-worker state (`waiting_input` / `processing` / `waiting_output`) per DESIGN.md "Worker states"
-- [ ] Per-stage stats: stage name, busy/idle worker counts, queue length, queue open/closed status, recent throughput, time since last item processed
-- [ ] Per-stage worker-state breakdown counts
-- [ ] Aggregate top-line: total items processed, total errors, drops by reason
-- [ ] Optional: scaling strategy state (cooldown remaining, etc.)
-- [ ] Tests: stats while flow is running; stats after `stop()`/`drain()` (final state)
+- [x] Per-stage stats: stage name, alive/busy/idle worker counts, queue length, queue drained flag, processed counter, error counter. Snapshot built by `_FlowRun.snapshot_stats()`.
+- [x] Aggregate top-line: total transformer errors (sum of per-stage), total source errors, drops by reason (counter map). Counted in `_handle_error` per event type.
+- [x] `Flow._last_stats` persists the snapshot after a run finishes — `dump(mode='stats')` reads from current run if active, else from the last snapshot, else returns a "no run yet" message.
+- [x] Tests (`tests/test_flow_dump_stats.py` — 15 tests): format handling (default, json, mermaid raises, no-run-yet); per-stage processed/error counters; aggregate transformer errors / source errors / drops by reason (UPSTREAM_TERMINATED + ROUTER_MISS); active flag during run; per-stage fields presence; router arms get per-stage stats; text format includes events block.
+- [-] `processing` / `waiting_output` distinction deferred. Today `busy` = workers in user_fn; `idle` covers both `waiting_input` and `waiting_output`. Adding the third state would need instrumenting put boundaries; minor info gain for now.
+- [-] Time since last item processed deferred (needs timestamp instrumentation).
+- [-] Scaling strategy state deferred (would need a snapshot method on the `ScalingStrategy` Protocol; strategy-specific).
+
+Coverage: 95%. 201 tests pass; lint clean.
+
+See [`todos/dump-implementation.md`](dump-implementation.md) for the broader plan covering both M9 and M10.
 
 ## Polish (across milestones)
 

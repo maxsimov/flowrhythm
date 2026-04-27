@@ -837,7 +837,25 @@ flow (5 stages):
   [5] db_write                           (sink)                         FixedScaling(workers=1) fifo_queue(maxsize=1)
 ```
 
-Sub-flow stages and router arms appear with dotted names (`dispatch.fast`, `ingest.parse`) — composition is visible at a glance. `chain.dump(mode="stats")` for live runtime stats is planned (M10).
+Sub-flow stages and router arms appear with dotted names (`dispatch.fast`, `ingest.parse`) — composition is visible at a glance.
+
+For live runtime stats, use `chain.dump(mode="stats")`. Readable both during a run and after it finishes:
+
+```python
+print(chain.dump(mode="stats"))
+# flow stats (completed):
+#   [0] parse              0 alive (0 busy, 0 idle)  queue=0 [drained]  processed=20  errors=0
+#   [1] boom_sometimes     0 alive (0 busy, 0 idle)  queue=0 [drained]  processed=16  errors=4
+#   [2] dispatch           0 alive (0 busy, 0 idle)  queue=0 [drained]  processed=16  errors=0
+#   ...
+#
+# events:
+#   transformer errors: 4
+#   source errors:      0
+#   drops: 0
+```
+
+Per-stage `processed` and `errors` counters plus aggregate event totals. Useful for spotting bottlenecks (look at `queue_length` and `busy`/`idle` ratios) and validating health (`errors` and `drops`). Mermaid format isn't supported for stats (stats aren't graph-shaped).
 
 ---
 
@@ -873,7 +891,7 @@ Sub-flow stages and router arms appear with dotted names (`dispatch.fast`, `inge
 | `flow.configure(name, scaling=..., queue=..., queue_size=...)` | Per-stage tuning. `queue=` is a queue factory (`fifo_queue`, `priority_queue`, …); `queue_size=` is the queue's `maxsize`. Either or both may be set independently. |
 | `flow.configure_default(scaling=..., queue=..., queue_size=...)` | Pipeline-wide defaults; same kwargs as `configure()` |
 | `flow.set_error_handler(handler)` | Set the error sink for uncaught transformer exceptions |
-| `flow.dump(mode="structure", format="text"\|"mermaid"\|"json")` | Inspect the flow. `mode="structure"` renders the pipeline graph (text for terminals, mermaid for docs/markdown, JSON for tooling). `mode="stats"` renders live runtime stats *(planned)*. |
+| `flow.dump(mode="structure"\|"stats", format="text"\|"mermaid"\|"json")` | Inspect the flow. `mode="structure"` renders the pipeline graph (text/mermaid/JSON). `mode="stats"` renders live runtime stats: per-stage worker counts, queue lengths, processed/error counters, drops by reason. Stats supports text + JSON only. |
 
 ### Types and helpers
 

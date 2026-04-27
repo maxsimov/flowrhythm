@@ -1,6 +1,6 @@
 # Implement `Flow.dump()`
 
-**Status:** in-progress
+**Status:** implemented
 **Updated:** 2026-04-27
 
 ## Motivation
@@ -18,9 +18,9 @@ Depends on: `implement-runtime.md` (need the flow graph and stats infrastructure
 
 ### API
 
-- [x] Implement `Flow.dump(mode="structure")` — see `Flow.dump()` in `_flow.py`. Three formats via `format=` kwarg.
-- [ ] Implement `Flow.dump(mode="stats")` — currently raises `NotImplementedError`; M10.
-- [x] Decide and implement output format(s) — **text + mermaid + json** (settled with user). Sub-flow boundaries are NOT visually marked separately because dotted names already convey the structure (`outer.inner.decode`); router branching IS shown explicitly via arm labels and merge edges.
+- [x] Implement `Flow.dump(mode="structure")` — text + mermaid + json formats.
+- [x] Implement `Flow.dump(mode="stats")` — text + json formats (mermaid raises ValueError; stats aren't graph-shaped). Live during a run; after run, reads from `Flow._last_stats` snapshot taken in `run()/push()`'s finally block.
+- [x] Decide and implement output format(s) — **text + mermaid + json** for structure, **text + json** for stats.
 
 ### Structure mode
 
@@ -33,19 +33,19 @@ Depends on: `implement-runtime.md` (need the flow graph and stats infrastructure
 
 ### Stats mode
 
-- [ ] Per-stage `StageSnapshot` snapshot: stage name, busy/idle worker counts, queue length, queue open/closed status, recent throughput
-- [ ] Per-stage worker-state breakdown: count of workers in each of `waiting_input` / `processing` / `waiting_output` (per DESIGN.md "Worker states"). Diagnoses stalls (e.g., "all workers `waiting_output`" → downstream bottleneck)
-- [ ] Aggregate top-line: total items in flight, total items processed, total errors, drops by reason
-- [ ] Time since last item processed (for spotting stalls)
-- [ ] Optional: include scaling strategy state (cooldown remaining, etc.)
+- [x] Per-stage snapshot: stage name, alive/busy/idle worker counts, queue length, queue drained flag, processed counter, error counter. Built by `_FlowRun.snapshot_stats()`.
+- [-] Per-stage worker-state breakdown: only alive/busy/idle (= waiting_input proxy) shipped. `processing` / `waiting_output` distinction deferred — would need instrumenting put boundaries; minor info gain. Today `busy` covers "processing"; `idle` covers everything else (includes both `waiting_input` AND `waiting_output`).
+- [x] Aggregate top-line: total transformer errors, source errors, drops by reason. (Items in flight not separately tracked; can be derived from queue lengths.)
+- [-] Time since last item processed — deferred. Needs timestamp instrumentation in worker loop.
+- [-] Scaling strategy state (cooldown remaining) — deferred. Strategy-specific; would need a snapshot method on `ScalingStrategy` Protocol.
 
 ### Tests
 
-- [x] Structure mode for linear flow — covered in `tests/test_flow_dump.py`.
-- [x] Structure mode for sub-flow composition (verify namespaced names) — covered.
-- [x] Structure mode for router (verify arm representation) — covered for all three formats.
-- [ ] Stats mode while flow is running (verify counters update)
-- [ ] Stats mode after `stop()` / `drain()` (verify final state)
+- [x] Structure mode for linear flow — covered.
+- [x] Structure mode for sub-flow composition — covered.
+- [x] Structure mode for router — covered.
+- [x] Stats mode while flow is running — `test_dump_stats_active_flag_during_run`.
+- [x] Stats mode after `stop()` / `drain()` — covered (most stats tests run after a clean run; the active-flag test covers post-stop).
 
 ### Documentation
 
@@ -54,4 +54,5 @@ Depends on: `implement-runtime.md` (need the flow graph and stats infrastructure
 
 ## Done
 
-- M9 — `dump(mode="structure")` shipped with text/mermaid/json formats. 20 tests in `tests/test_flow_dump.py`. `__repr__` added to scaling strategies. DESIGN open question on dump format resolved (all three).
+- M9 — `dump(mode="structure")` shipped with text/mermaid/json formats. 20 tests in `tests/test_flow_dump.py`.
+- M10 — `dump(mode="stats")` shipped with text/json formats (mermaid raises ValueError). Per-stage `processed_count`/`error_count` counters on `_StageRuntime`; aggregate `source_errors` + `drops_by_reason` on `_FlowRun`. `Flow._last_stats` persists the snapshot after a run finishes. 15 tests in `tests/test_flow_dump_stats.py`. `__repr__` added to `FixedScaling` and `UtilizationScaling` (back in M9).

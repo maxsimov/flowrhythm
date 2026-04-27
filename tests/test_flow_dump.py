@@ -348,17 +348,4 @@ async def test_dump_json_includes_scaling_repr():
     assert "Utilization" in s0["scaling"]
 
 
-# ---------------------------------------------------------------------------
-# Stats mode — not implemented in M9; should raise
-# ---------------------------------------------------------------------------
-
-
-async def test_dump_stats_mode_not_yet_implemented():
-    import pytest
-
-    async def fn(x):
-        return x
-
-    chain = flow(fn)
-    with pytest.raises(NotImplementedError, match="stats"):
-        chain.dump(mode="stats")
+# Stats mode is M10 — see tests/test_flow_dump_stats.py

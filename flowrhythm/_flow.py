@@ -321,6 +321,15 @@ class _StageRuntime:
     # wins (first-set takes precedence in `_FlowRun.__init__`).
     arm_merge_idx: int | None = None
 
+    # --- M10: stats counters ---
+    # Items this stage's worker(s) successfully processed (user_fn returned
+    # without raising). For classifier stages this counts every dispatched
+    # item. For sink stages this counts every item the sink consumed.
+    processed_count: int = 0
+    # Times this stage's worker(s) raised inside user_fn (and the failure
+    # was routed to the error handler as a TransformerError).
+    error_count: int = 0
+
 
 class Flow:
     """A pipeline of stages. Construct via the `flow()` factory."""
@@ -349,6 +358,9 @@ class Flow:
         # Set while a run is in progress; used by drain() / stop() to
         # reach into the active _FlowRun. None when no run is active.
         self._current_run: "_FlowRun | None" = None
+        # M10: snapshot of stats from the most recent finished run, so
+        # `dump(mode='stats')` stays useful after the run ends.
+        self._last_stats: dict[str, Any] | None = None
 
     @property
     def stage_names(self) -> list[str]:
@@ -439,6 +451,7 @@ class Flow:
         try:
             await runner.execute()
         finally:
+            self._last_stats = runner.snapshot_stats(active=False)
             self._current_run = None
 
     @asynccontextmanager
@@ -468,6 +481,7 @@ class Flow:
                 await handle.complete()
                 await exec_task
             finally:
+                self._last_stats = run.snapshot_stats(active=False)
                 self._current_run = None
 
     async def drain(self) -> None:
@@ -493,15 +507,15 @@ class Flow:
             data = json.loads(chain.dump(format="json"))
 
         `mode="structure"` renders the expanded pipeline graph (stages,
-        scaling, queue config, router branches). `mode="stats"` will be
-        added in M10.
+        scaling, queue config, router branches). `mode="stats"` shows
+        live runtime stats (worker counts, queue lengths, processed
+        counters, error/drop totals) — readable during a run AND after
+        the run finishes. Mermaid format isn't supported for stats.
         """
         if mode == "structure":
             return _dump_structure(self, format)
         if mode == "stats":
-            raise NotImplementedError(
-                "dump(mode='stats') is not implemented yet (M10)"
-            )
+            return _dump_stats(self, format)
         raise ValueError(
             f"unknown mode {mode!r}; expected 'structure' or 'stats'"
         )
@@ -610,6 +624,71 @@ def _render_mermaid(info: list[dict[str, Any]]) -> str:
                 lines.append(f"    {node_id} -->|default| s{s['default']}")
         elif s["downstream"] is not None:
             lines.append(f"    {node_id} --> s{s['downstream']}")
+    return "\n".join(lines)
+
+
+# --- M10: stats rendering ---------------------------------------------------
+
+
+def _dump_stats(flow: "Flow", fmt: str) -> str:
+    if fmt == "mermaid":
+        raise ValueError(
+            "mermaid format is not supported for mode='stats'; "
+            "use 'text' or 'json'"
+        )
+    # Prefer the live run if one is in progress; otherwise fall back to
+    # the snapshot from the most recent finished run.
+    if flow._current_run is not None:
+        stats = flow._current_run.snapshot_stats(active=True)
+    elif flow._last_stats is not None:
+        stats = flow._last_stats
+    else:
+        if fmt == "json":
+            import json as _json
+            return _json.dumps({"active": False, "stages": [], "events": {}})
+        return "flow stats: no run yet (call chain.run(...) first)"
+
+    if fmt == "text":
+        return _render_stats_text(stats)
+    if fmt == "json":
+        import json as _json
+        return _json.dumps(stats, indent=2)
+    raise ValueError(
+        f"unknown format {fmt!r}; expected 'text' or 'json'"
+    )
+
+
+def _render_stats_text(stats: dict[str, Any]) -> str:
+    state = "active" if stats["active"] else "completed"
+    lines = [f"flow stats ({state}):"]
+    name_w = max(
+        (len(s["name"]) for s in stats["stages"]), default=4
+    ) + 2
+    for s in stats["stages"]:
+        name_col = s["name"].ljust(name_w)
+        workers = (
+            f"{s['alive']} alive ({s['busy']} busy, {s['idle']} idle)"
+        )
+        q = (
+            f"queue={s['queue_length']}"
+            + (" [drained]" if s["queue_drained"] else "")
+        )
+        lines.append(
+            f"  [{s['index']}] {name_col} {workers:30s} {q:18s} "
+            f"processed={s['processed']:<8d} errors={s['errors']}"
+        )
+    ev = stats["events"]
+    lines.append("")
+    lines.append("events:")
+    lines.append(f"  transformer errors: {ev['transformer_errors']}")
+    lines.append(f"  source errors:      {ev['source_errors']}")
+    drops = ev.get("drops", {})
+    if drops:
+        lines.append("  drops:")
+        for reason, count in drops.items():
+            lines.append(f"    {reason}: {count}")
+    else:
+        lines.append("  drops: 0")
     return "\n".join(lines)
 
 
@@ -795,6 +874,10 @@ class _FlowRun:
         # Run-completion state
         self._source_finished = False
         self._done_event = asyncio.Event()
+
+        # M10: aggregate event counters
+        self.source_errors: int = 0
+        self.drops_by_reason: dict[DropReason, int] = {}
 
     @property
     def _n(self) -> int:
@@ -1002,6 +1085,44 @@ class _FlowRun:
             self._check_done()
         await self._done_event.wait()
 
+    def snapshot_stats(self, *, active: bool) -> dict[str, Any]:
+        """Snapshot the current per-stage and aggregate stats. Called by
+        `Flow.dump(mode='stats')` while a run is in progress and stored
+        on the Flow when the run finishes (so stats remain readable
+        after stop/drain)."""
+        stages: list[dict[str, Any]] = []
+        for i, s in enumerate(self._stages):
+            try:
+                queue_length = s.queue.qsize()  # type: ignore[attr-defined]
+            except Exception:
+                queue_length = -1
+            stages.append(
+                {
+                    "index": i,
+                    "name": s.name,
+                    "alive": s.alive,
+                    "busy": s.busy,
+                    "idle": s.alive - s.busy,
+                    "queue_length": queue_length,
+                    "queue_drained": s.input_drained,
+                    "processed": s.processed_count,
+                    "errors": s.error_count,
+                }
+            )
+        transformer_errors = sum(s.error_count for s in self._stages)
+        return {
+            "active": active,
+            "stages": stages,
+            "events": {
+                "transformer_errors": transformer_errors,
+                "source_errors": self.source_errors,
+                "drops": {
+                    reason.name: count
+                    for reason, count in self.drops_by_reason.items()
+                },
+            },
+        }
+
     async def _handle_error(self, event: ErrorEvent) -> None:
         """Call the user's error handler with `event`.
 
@@ -1014,6 +1135,15 @@ class _FlowRun:
         Catches `Exception` only (NOT `BaseException`) so cooperative
         cancellation propagates — see DESIGN.md "Asyncio safety notes".
         """
+        # M10: count event by type for `dump(stats)`. TransformerError is
+        # already counted on the firing stage; here we tally the
+        # framework-level totals for SourceError + Dropped.
+        if isinstance(event, SourceError):
+            self.source_errors += 1
+        elif isinstance(event, Dropped):
+            self.drops_by_reason[event.reason] = (
+                self.drops_by_reason.get(event.reason, 0) + 1
+            )
         try:
             await self._handler(event)
         except Exception as exc:
@@ -1234,12 +1364,17 @@ class _FlowRun:
                         # dropped (no put downstream). Catches Exception
                         # only so CancelledError propagates — see DESIGN.md
                         # "Asyncio safety notes".
+                        s.error_count += 1
                         await self._handle_error(
                             TransformerError(
                                 item=item, exception=exc, stage=s.name
                             )
                         )
                         continue
+
+                    # Successful processing — count it. Done before the
+                    # downstream put so errors there don't undercount.
+                    s.processed_count += 1
 
                     if isinstance(result, Last):
                         # Initiate the Last cascade: kill upstream, cancel
