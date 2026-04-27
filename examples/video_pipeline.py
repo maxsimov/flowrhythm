@@ -38,7 +38,6 @@ from flowrhythm import (
     UtilizationScaling,
     flow,
     router,
-    stage,
 )
 
 
@@ -74,20 +73,21 @@ async def url_source():
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: fetch metadata (mocked yt-dlp / HTTP API).
-# CM factory pattern: each worker opens an HTTP session ONCE and reuses
-# it for every item it processes.
+# fetch_metadata — CM factory: each worker opens an HTTP session ONCE
+# and reuses it for every item it processes.
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
-async def with_http_session():
+async def fetch_metadata():
     session = {"connected": True}  # would be: aiohttp.ClientSession()
 
     async def fetch(url: str) -> Video:
         await asyncio.sleep(0.05)  # simulate API call
-        # 1-in-20 simulated "video unavailable" failure
-        if random.random() < 0.05:
+        # Deterministic "unavailable" failure for /video/13 — exercises the
+        # error handler so users see how per-item failures are routed
+        # without killing the pipeline.
+        if url.endswith("/13"):
             raise RuntimeError(f"video unavailable: {url}")
         codec = random.choice(["h264", "vp9", "av1"])
         return Video(
@@ -105,7 +105,7 @@ async def with_http_session():
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: classifier — route based on whether transcoding is needed.
+# Classifier — route based on whether transcoding is needed.
 # ---------------------------------------------------------------------------
 
 
@@ -114,7 +114,7 @@ async def classify_for_conversion(video: Video) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: download — used by both arms. I/O bound, scales wide.
+# download — used by both arms. I/O bound, scales wide.
 # ---------------------------------------------------------------------------
 
 
@@ -125,7 +125,7 @@ async def download(video: Video) -> Video:
 
 
 # ---------------------------------------------------------------------------
-# Stage 4 (convert arm only): transcode — CPU-bound via ffmpeg subprocess.
+# transcode (convert arm only) — CPU-bound via ffmpeg subprocess.
 # Capped to 2 workers because more would just oversubscribe the CPU.
 # ---------------------------------------------------------------------------
 
@@ -139,12 +139,12 @@ async def transcode(video: Video) -> Video:
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: upload — per-worker S3 client via CM factory.
+# upload — CM factory for per-worker S3 client.
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
-async def with_s3_client():
+async def upload():
     client = {"region": "us-east-1"}  # would be: boto3.client("s3")
 
     async def do_upload(video: Video) -> Video:
@@ -159,7 +159,7 @@ async def with_s3_client():
 
 
 # ---------------------------------------------------------------------------
-# Stage 6: record_db — light, single-worker for insert ordering.
+# record_db — light, single-worker for insert ordering.
 # ---------------------------------------------------------------------------
 
 
@@ -201,33 +201,34 @@ async def on_error(event):
 
 async def main():
     chain = flow(
-        stage(with_http_session, name="fetch_metadata"),
-        stage(
-            router(
-                classify_for_conversion,
-                convert=flow(download, transcode),
-                passthrough=download,
-            ),
-            name="dispatch",
+        fetch_metadata,
+        router(
+            classify_for_conversion,
+            convert=flow(download, transcode),
+            passthrough=download,
         ),
-        stage(with_s3_client, name="upload"),
+        upload,
         record_db,
         on_error=on_error,
     )
 
     # Per-stage tuning — each strategy matched to the stage's nature.
+    # Stage names auto-derived from function names; the router with no
+    # explicit name gets `_router_0` (and dotted sub-stage names below it).
     chain.configure(
-        "fetch_metadata", scaling=UtilizationScaling(min_workers=2, max_workers=8)
+        "fetch_metadata",
+        scaling=UtilizationScaling(min_workers=2, max_workers=8),
     )
     chain.configure(
-        "dispatch.convert.download",
+        "_router_0.convert.download",
         scaling=UtilizationScaling(min_workers=4, max_workers=12),
     )
     chain.configure(
-        "dispatch.convert.transcode", scaling=FixedScaling(workers=2)
+        "_router_0.convert.transcode",
+        scaling=FixedScaling(workers=2),
     )
     chain.configure(
-        "dispatch.passthrough",
+        "_router_0.passthrough",
         scaling=UtilizationScaling(min_workers=4, max_workers=12),
     )
     chain.configure(
@@ -262,5 +263,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    random.seed(42)  # deterministic failures across runs
+    random.seed(42)  # deterministic codec/duration distribution
     asyncio.run(main())
