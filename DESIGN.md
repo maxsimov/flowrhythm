@@ -630,17 +630,21 @@ Backs README guarantee: *"Every item that enters the chain reaches a terminal st
 
 ### I10 — `Last(value)` ordering (topology-aware)
 
-When a transformer at stage `i` returns `Last(value)`, the runtime computes the **kill range** as `[0, downstream_stage_idx)` — where `downstream_stage_idx` is `i+1` for normal stages, the merge index for arm-end stages, or `_n` if `i` is the last stage in the pipeline.
+When a transformer at stage `i` returns `Last(value)`, the runtime picks the **kill range** end:
+- `arm_merge_idx` if stage `i` is inside a router arm (the merge of the enclosing arm — for nested arms, the OUTERMOST one wins, set at `_FlowRun.__init__` with first-wins iteration)
+- otherwise `downstream_stage_idx` for normal stages, or `_n` if `i` is the last stage in the pipeline
+
+For stages inside an arm, the kill range additionally **excludes the initiator's own downstream chain** — the stages reached by walking `downstream_stage_idx → downstream_stage_idx → ...` from `i+1` up to but not including the merge. Those must stay alive so the Last value can flow through to the merge.
 
 The cascade then:
-- Shuts down every queue in the kill range — for routers this includes the classifier AND every sibling arm, not just the firing arm. Items still upstream are dropped (with `DropReason.UPSTREAM_TERMINATED` for source items).
-- Cancels idle workers in stage `i` (state 3 — safe). Sibling arms' idle workers wake from `QueueShutDown` from the same shutdown call.
-- Polls until every stage in the kill range has fully drained (alive == 0 for non-self stages; alive == 1 for the initiator).
+- Shuts down every queue in the kill range minus the initiator's chain — for routers this kills the classifier AND every sibling arm. Items still upstream are dropped (with `DropReason.UPSTREAM_TERMINATED` for source items).
+- Cancels idle workers in stage `i` (state 3 — safe). Killed stages' idle workers wake from `QueueShutDown` from the same shutdown call.
+- Polls until every killed stage has fully drained (alive == 0 for non-self; alive == 1 for the initiator).
 - Puts `value` into the destination queue (`downstream_stage_idx`'s queue), or drops it if `downstream_stage_idx` is None.
 
-Result: `value` is the last item to enter the destination queue. With a single-worker downstream, it is the last item the downstream processes. With multi-worker downstream, per-worker ordering isn't guaranteed (same caveat as elsewhere — see "Across multi-worker stages, order is not preserved").
+Result: `value` enters the destination queue last; with single-worker downstream, it's the last item processed. (Multi-worker downstream → per-worker ordering not guaranteed, same caveat as elsewhere.)
 
-For Last from inside a router arm, this guarantees no sibling-arm items can sneak past `value` into the merge queue.
+For Last from anywhere inside a router arm — including the middle of a multi-stage arm sub-flow — this guarantees no sibling-arm items can sneak past `value` into the merge queue.
 
 Backs README guarantee: *"`Last(value)` is final."*
 

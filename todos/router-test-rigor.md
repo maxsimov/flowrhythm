@@ -1,6 +1,6 @@
 # Router test rigor
 
-**Status:** planned
+**Status:** in-progress
 **Updated:** 2026-04-27
 
 ## Motivation
@@ -19,24 +19,18 @@ This plan captures targeted tests to close those gaps, ranked by bug-catching va
 
 ### Conservation (catches: lost/duplicated items)
 
-- [ ] **Conservation across topology variations** — generate items with unique IDs, run through linear / single-router / nested-router / sequential-routers; assert `len(received) == N` AND `set(ids_received) == set(ids_sent)`. Parametrize over topologies in one test.
+- [x] **Conservation across topology variations** — `tests/test_router_rigor.py`: 4 tests covering linear, single-router, nested-router (with inner merge), sequential-routers. All N=100 items in → N items out, exact ID set match.
 - [ ] **Stress conservation** — 5,000 items through a multi-arm router with multi-worker arms (`FixedScaling(workers=4)` per arm). Exact count + uniqueness asserted. Catches subtle dispatch races, queue-close races, backpressure-related drops.
-- [ ] **No cross-arm contamination via item identity** — items as `dict` with `{"id": N, "visited_arms": []}`. Each arm appends its label. Assert each item's `visited_arms` is a singleton (exactly the arm the classifier sent it to). The path-tracing test does this for single items per path; this asserts the property as an invariant across many concurrent items.
+- [x] **No cross-arm contamination via item identity** — `tests/test_router_rigor.py::test_conservation_no_cross_arm_contamination`. 200 items through 3-arm router; each item's `visited_arms` is a singleton, and the dispatch matches the classifier's decision.
 
 ### Topology introspection (catches: wiring bugs)
 
-- [ ] **Direct assertions on `_stages` after construction** — for known topologies, assert exactly:
-  - `classifier._stages[i].downstream_stage_idx is None`
-  - `arm_end.downstream_stage_idx == merge_idx`
-  - `merge.pending_inputs == N_arm_ends`
-  - `classifier.cascade_targets == [arm_first_indices]`
-  
-  Catches bugs where the runtime "works" but the data structure is wrong (off-by-one in `pending_inputs`, missing arm in `cascade_targets`, etc.).
+- [x] **Direct assertions on `_stages` after construction** — `tests/test_router_rigor.py`: 3 tests pin down classifier `downstream_stage_idx is None` + correct `cascade_targets`, arm-end `downstream_stage_idx == merge_idx`, merge `pending_inputs == N_arms`, default-arm inclusion, and router-as-last (downstream=None for arm-ends).
 - [ ] **Re-indexing stress** — build `flow(s1, s2, sub_flow_with_router, s3)` with the sub-flow at varying offsets; assert all hint indices in the resulting `_stages` are correct absolute indices. Catches re-indexer off-by-ones today's tests would mask because output values still happen to match.
 
 ### Multi-stage arm Flows (catches: arm-pipeline bugs)
 
-- [ ] **Arm with multi-stage sub-flow** — `flow(router(c, slow=flow(s1, s2, s3, s4)))`. Verify items take the path `cls → s1 → s2 → s3 → s4 → merge` with breadcrumbs. Today's arm-Flow tests use 2-stage Flows; longer arms could expose drain-cascade or naming bugs.
+- [x] **Arm with multi-stage sub-flow** — `tests/test_router_rigor.py::test_multi_stage_arm_flow_path_tracing`. 4-stage arm Flow; breadcrumbs verify the full path.
 - [ ] **Multi-stage arm with nested router AND a tail stage** — `flow(router(c1, slow=flow(s1, router(c2, x=x, y=y), tag)))`. Three levels of topology; verify breadcrumbs for every path through the outer-arm `slow`.
 
 ### Last cascade bounds (catches: under/over-kill bugs)
@@ -46,12 +40,12 @@ This plan captures targeted tests to close those gaps, ranked by bug-catching va
   - Assert classifier exited
   - Assert merge processed Last value
   - Assert NO sibling-arm items appear in sink AFTER Last value (formal assertion across many items, not single-item)
-- [ ] **Last from middle of multi-stage arm** — `flow(router(c, path=flow(s1, s2_returns_last, s3)))`. Last fires from `s2` (middle of arm). Today's tests fire Last from arm-end or single-stage arm. Cascade with `downstream_stage_idx` pointing inside the arm (not the merge) might behave differently.
+- [x] **Last from middle of multi-stage arm** — `tests/test_router_rigor.py::test_last_from_middle_of_arm_subflow_is_absolute_last`. **Found a real bug**: cascade kill range was based on the firing stage's immediate `downstream_stage_idx`, which doesn't include sibling arms when the firing stage is in the middle of a multi-stage arm. Fixed by adding `arm_merge_idx` to `_StageRuntime` (the merge of the enclosing arm; outermost wins for nested arms) and using it as the kill boundary. The initiator's own downstream chain is excluded from the kill range so the Last value can still flow through to the merge. I10 invariant updated.
 - [ ] **Concurrent Last from multiple arms** — both arms return Last on different items. Race condition: which one wins? Both? Document and lock down behavior with a test (might require a runtime decision: "first Last wins, others ignored" vs current undefined behavior).
 
 ### Backpressure (catches: blocking bugs)
 
-- [ ] **Slow merge backpressures arms backpressures classifier** — merge with `queue_size=1` and slow processing; arm queues fill; classifier blocks on dispatch. Verify items aren't lost; verify the backpressure chain works end-to-end.
+- [x] **Slow merge backpressures arms backpressures classifier** — `tests/test_router_rigor.py::test_backpressure_through_router_no_loss`. 50 items through a slow-merge bottleneck with `queue_size=1`; all delivered, no losses.
 - [ ] **Slow arm + classifier scaling** — single-worker classifier dispatching to slow arm A. Classifier blocks → can't dispatch to arm B even if arm B is free. With multi-worker classifier, parallelism survives. Verify the behavior matches docs.
 
 ### Edge cases (catches: corner-case bugs)
