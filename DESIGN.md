@@ -124,6 +124,20 @@ outer.configure("x.decode", scaling=FixedScaling(workers=8))    # overrides inne
 
 If the parent doesn't override, the sub-flow's config carries through unchanged. Order: standard "most-specific wins" pattern (matches CSS, layered config files, etc.).
 
+#### Sub-flow autonomy: what carries over and what doesn't
+
+A sub-flow is **mostly autonomous** — its per-stage configuration and pipeline-wide defaults survive composition so the same `Flow` definition behaves identically standalone or composed (a stated guarantee). Two carve-outs apply.
+
+**Carries over** (sub-flow is autonomous):
+- **Per-stage `configure()` calls** on the sub-flow → folded into the parent's config map under prefixed names (`x.decode`). Parent can override.
+- **Sub-flow's `default_scaling` / `default_queue` / `default_queue_size`** → resolved at inlining time into explicit per-stage entries for each sub-stage. So if `inner = flow(parse, validate, default_scaling=FixedScaling(workers=4))`, the inliner stores `{"x.parse": {"scaling": FixedScaling(4)}, "x.validate": {"scaling": FixedScaling(4)}}` in the parent. Sub-stages still run with 4 workers; the sub-flow's defaults do **not** leak into the parent's "default-for-everything-else" namespace.
+
+**Discarded** (parent dominates):
+- **Sub-flow's `on_error`** → discarded. The parent's error handler always wins. Error handling is an *activation* concern (one handler per pipeline, per existing rule), and only the outermost flow activates. The sub-flow's handler matters only when the sub-flow is run standalone.
+- **Sub-flow's activation methods** (`run()`, `push()`, `drain()`, `stop()`) — calling these on an embedded sub-flow is an error in spirit, though not currently enforced. Activation belongs to the outermost flow; the sub-flow has no live `_current_run` while embedded.
+
+**Empty sub-flow** (zero stages): no-op. The inliner skips it. No prefix is consumed; positional indices for the `_subflow_N` fallback advance regardless.
+
 #### Name collisions
 
 Top-level stages and sub-stages live in different namespaces, so collision is impossible by construction:
@@ -627,6 +641,15 @@ For `_done_event` to fire (and for `run()` / `async with chain.push()` to termin
 - **Push mode** (`async with chain.push() as h:`): there is no `_source_task`. `_source_finished` is set by `PushHandle.complete()` (via `_mark_complete`), `Flow.drain()`, or `Flow.stop()` directly.
 
 Both paths converge on I7's done-condition. Without this invariant, push-mode `drain()` / `stop()` would hang forever (queues shut down, workers exit, alive → 0, but `_source_finished` stays False so `_done_event` never fires).
+
+### I12 — A composed sub-flow has no runtime presence in the parent
+
+When a `Flow` is inlined into another `flow()` at construction, only its `_stages` list and the resolved per-sub-stage config (from `_stage_config` + `_default_config`) are copied into the parent. The sub-flow's `_error_handler`, `_current_run`, and any subsequent `configure()` calls on the sub-flow object are **not** observed by the parent's `_FlowRun`.
+
+Implications:
+- Parent's `on_error` always wins for events from sub-stages — backs the "Sub-flow autonomy" carve-out.
+- Activating an embedded sub-flow directly (`inner.run(...)` after `outer = flow(inner, ...)`) would create a separate `_FlowRun` on `inner`, parallel to and disconnected from `outer` — currently not enforced as an error, but never useful.
+- Modifying `inner.configure(...)` after composition has no effect — the inlined config was baked at construction time.
 
 ---
 

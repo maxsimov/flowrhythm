@@ -197,14 +197,15 @@ Coverage: 95% overall (93% on `_flow.py`). 103 tests pass in 0.09s. `make lint` 
 
 Goal: a `Flow` used inside another `flow()` is expanded into the parent's pipeline graph.
 
-- [ ] Sub-flow expansion algorithm per DESIGN.md "Inlining algorithm":
-  - Pick prefix from `stage(inner, name="...")` or fallback `_subflow_N`
-  - Expand sub-stages with `<prefix>.<sub_stage>` names
-  - Carry over the sub-flow's per-stage config under prefixed names
-  - Recurse for nested sub-flows
-- [ ] Configuration merge order: most-specific wins (parent's `configure()` overrides sub-flow's pre-existing config)
-- [ ] `stage(fn, name=...)` wrapper supports both functions and `Flow` instances (for explicit sub-flow naming)
-- [ ] Tests: composition preserves behavior; standalone vs composed produce identical output; nested sub-flows expand correctly with dotted names; parent override beats sub-flow config
+- [x] Sub-flow expansion algorithm — implemented as three phases inside `flow()`: (1) walk args, expand sub-flow stages with `<prefix>.<sub_stage>` names, accumulate raw items + per-sub-stage effective config; (2) collision-suffix names; (3) construct Flow and bake inlined configs into parent's `_stage_config`. Recursion is implicit — sub-flows are pre-inlined at their own construction, so nested `flow()` calls just prepend another prefix.
+- [x] Naming: explicit prefix from `stage(inner, name="...")`; fallback `_subflow_N` where N is a per-call counter (only sub-flows increment it; named sub-flows don't consume an index)
+- [x] Configuration merge order: parent's `configure()` overrides sub-flow's pre-existing config per key (not per stage). Sub-flow's per-stage > sub-flow's default > parent's default > built-in default. Built-in defaults are NOT baked at inlining — they fall through to parent's `_resolve_config` so a parent default can still fill an unset key.
+- [x] `stage(target, name=...)` helper — `_NamedStage` dataclass wrapper + `stage()` factory; works for both transformers (renames) and Flow instances (sets the inlining prefix); rejects empty name
+- [x] Carve-outs per DESIGN "Sub-flow autonomy": parent's `on_error` always wins (sub-flow's `_error_handler` is never consulted while composed); empty sub-flow is no-op (currently impossible to construct since `flow()` requires ≥ 1 stage, but the inliner would handle it correctly)
+- [x] Tests (`tests/test_flow_subflow.py` — 16 tests): `stage()` helper basics + empty-name rejection; basic inlining + name prefixing; standalone vs composed produces identical output; fallback `_subflow_N` naming; two unwrapped sub-flows get distinct indices; per-stage carries over; defaults baked; sub-flow defaults don't leak to parent stages; parent overrides sub-flow; parent default applies when sub-flow set nothing; nested dotted names; nested per-stage propagates; sub-flow `on_error` is discarded
+- [x] `__init__.py` exports `stage`
+
+Coverage: 95% overall (94% on `_flow.py`). 118 tests pass in 0.09s. `make lint` clean.
 
 ### M8 — Router
 
