@@ -102,7 +102,7 @@ async def fetch_metadata():
 # ---------------------------------------------------------------------------
 
 
-async def classify_for_conversion(video: Video) -> str:
+async def dispatch(video: Video) -> str:
     return "convert" if video.needs_conversion else "passthrough"
 
 
@@ -196,8 +196,7 @@ async def main():
     chain = flow(
         fetch_metadata,
         router(
-            classify_for_conversion,
-            name="dispatch",     # router(name=) — short stage name in dump output
+            dispatch,
             convert=flow(download, transcode),
             passthrough=download,
         ),
