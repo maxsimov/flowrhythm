@@ -55,8 +55,8 @@ There are three layers of documentation, each with its own audience:
 
 ### memory/
 
-- `memory/MEMORY.md` indexes Claude's accumulated session memory (feedback, project facts, references), one file per memory.
-- Read it at session start; add or update entries when project facts or working preferences change.
+- @memory/MEMORY.md — index of Claude's accumulated session memory (feedback, project facts, references), one file per memory. Auto-loaded at session start.
+- Read the linked file for any entry you act on; add or update entries when project facts or working preferences change.
 
 ## TODO plans
 
