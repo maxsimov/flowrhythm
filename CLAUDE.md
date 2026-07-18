@@ -53,6 +53,11 @@ There are three layers of documentation, each with its own audience:
 - Do **not** put implementation tasks here — those go in `todos/`
 - DESIGN.md says "the rule"; `todos/` says "what we're doing about it"
 
+### memory/
+
+- `memory/MEMORY.md` indexes Claude's accumulated session memory (feedback, project facts, references), one file per memory.
+- Read it at session start; add or update entries when project facts or working preferences change.
+
 ## TODO plans
 
 - `todos/` holds individual TODO plan files; `todos/INDEX.md` is the index, listed in **priority order (top is highest)**
